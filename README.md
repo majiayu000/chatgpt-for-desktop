@@ -10,3 +10,7 @@ Also can executed or mutated by source code
 cd chatgpt-for-desktop
 cargo tauri dev
 ```
+
+## Todo
+Maybe should save password locally...
+Add more menu for 
