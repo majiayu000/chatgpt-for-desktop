@@ -7,5 +7,6 @@ A small desktop version for ChatGPT.
 You can run it on win\mac
 Also can executed or mutated by source code
 ```
+cd chatgpt-for-desktop
 cargo tauri dev
 ```
