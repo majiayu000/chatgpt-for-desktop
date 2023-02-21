@@ -13,4 +13,5 @@ cargo tauri dev
 
 ## Todo
 Maybe should save password locally...
+
 Add more menu for 
