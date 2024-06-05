@@ -6,7 +6,7 @@
     "distDir": "../ui"
   },
   "package": {
-    "productName": "openai",
+    "productName": "POE",
     "version": "0.1.0"
   },
   "tauri": {
@@ -57,9 +57,9 @@
         "fullscreen": false,
         "height": 1080,
         "resizable": true,
-        "title": "chatgpt",
+        "title": "POE",
         "width": 1440,
-        "url": "https://chat.openai.com"
+        "url": "https://poe.com"
       }
     ]
   }
