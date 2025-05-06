@@ -9,6 +9,10 @@ default-run = "app"
 edition = "2021"
 rust-version = "1.59"
 
+[[bin]]
+name = "icon_generator"
+path = "icon_generator.rs"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [build-dependencies]
@@ -17,9 +21,10 @@ tauri-build = { version = "2.2.0", features = [] }
 [dependencies]
 serde_json = "1.0.140"
 serde = { version = "1.0.219", features = ["derive"] }
-tauri = { version = "2.5.1", features = ["native-tls"] }
+tauri = { version = "2.5.1", features = ["native-tls", "tray-icon"] }
 webbrowser = "1.0.4"
 tauri-plugin-http = "2.4.3"
+image = "0.24.7"
 
 [features]
 # by default Tauri runs in production mode
