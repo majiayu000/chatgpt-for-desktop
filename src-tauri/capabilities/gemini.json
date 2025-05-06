@@ -1,0 +1,17 @@
+{
+  "identifier": "gemini",
+  "description": "Google Gemini capabilities",
+  "permissions": [
+    {
+      "identifier": "http:default",
+      "allow": [
+        {
+          "url": "https://*.google.com"
+        },
+        {
+          "url": "https://gemini.google.com"
+        }
+      ]
+    }
+  ]
+}

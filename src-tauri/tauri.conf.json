@@ -1,66 +1,55 @@
 {
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Gemini",
+  "version": "0.1.0",
+  "identifier": "com.lif.dev",
   "build": {
     "beforeBuildCommand": "",
     "beforeDevCommand": "",
-    "devPath": "../ui",
-    "distDir": "../ui"
+    "devUrl": "https://gemini.google.com/app",
+    "frontendDist": "../ui"
   },
-  "package": {
-    "productName": "POE",
-    "version": "0.1.0"
-  },
-  "tauri": {
-    "allowlist": {
-      "all": false
-    },
-    "bundle": {
-      "active": true,
-      "category": "DeveloperTool",
-      "copyright": "",
-      "deb": {
-        "depends": []
-      },
-      "externalBin": [],
-      "icon": [
-        "icons/32x32.png",
-        "icons/128x128.png",
-        "icons/128x128@2x.png",
-        "icons/icon.icns",
-        "icons/icon.ico"
-      ],
-      "identifier": "com.lif.dev",
-      "longDescription": "",
-      "macOS": {
-        "entitlements": null,
-        "exceptionDomain": "",
-        "frameworks": [],
-        "providerShortName": null,
-        "signingIdentity": null
-      },
-      "resources": [],
-      "shortDescription": "",
-      "targets": "all",
-      "windows": {
-        "certificateThumbprint": null,
-        "digestAlgorithm": "sha256",
-        "timestampUrl": ""
-      }
-    },
+  "app": {
     "security": {
-      "csp": null
-    },
-    "updater": {
-      "active": false
+      "csp": "default-src 'self' https://gemini.google.com https://*.google.com; style-src 'self' 'unsafe-inline' https://gemini.google.com https://*.google.com; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://gemini.google.com https://*.google.com; img-src 'self' data: https: http:; connect-src 'self' https: wss:;"
     },
     "windows": [
       {
         "fullscreen": false,
         "height": 1080,
         "resizable": true,
-        "title": "POE",
+        "title": "Gemini",
         "width": 1440,
-        "url": "https://poe.com"
+        "url": "https://gemini.google.com/app"
       }
     ]
-  }
+  },
+  "bundle": {
+    "active": true,
+    "category": "DeveloperTool",
+    "copyright": "",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "entitlements": null,
+      "exceptionDomain": "",
+      "frameworks": [],
+      "providerShortName": null,
+      "signingIdentity": null
+    },
+    "resources": [],
+    "shortDescription": "",
+    "targets": "all",
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": ""
+    }
+  },
+  "plugins": {}
 }

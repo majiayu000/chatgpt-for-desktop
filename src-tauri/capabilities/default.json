@@ -1,0 +1,9 @@
+{
+  "identifier": "default",
+  "description": "Default capabilities",
+  "permissions": [
+    "core:default",
+    "core:window:default",
+    "core:webview:default"
+  ]
+}
