@@ -10,8 +10,26 @@
         },
         {
           "url": "https://gemini.google.com"
+        },
+        {
+          "url": "https://accounts.google.com"
+        },
+        {
+          "url": "https://*.gstatic.com"
+        },
+        {
+          "url": "https://*.googleapis.com"
+        },
+        {
+          "url": "https://*"
         }
       ]
-    }
-  ]
+    },
+    "core:webview:default",
+    "core:window:default",
+    "core:default"
+  ],
+  "remote": {
+    "urls": ["https://*.google.com", "https://gemini.google.com", "https://accounts.google.com"]
+  }
 }

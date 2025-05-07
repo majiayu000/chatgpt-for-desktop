@@ -5,6 +5,7 @@
     "core:default",
     "core:window:default",
     "core:webview:default",
-    "core:tray:default"
+    "core:tray:default",
+    "store:default"
   ]
 }

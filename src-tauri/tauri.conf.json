@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Gemini",
+  "productName": "AI Assistant",
   "version": "0.1.0",
-  "identifier": "com.lif.dev",
+  "identifier": "com.lif.ai.assistant",
   "build": {
     "beforeBuildCommand": "",
     "beforeDevCommand": "",
@@ -11,7 +11,7 @@
   },
   "app": {
     "security": {
-      "csp": "default-src 'self' https://gemini.google.com https://*.google.com https://poe.com https://*.poe.com; style-src 'self' 'unsafe-inline' https://gemini.google.com https://*.google.com https://poe.com https://*.poe.com; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://gemini.google.com https://*.google.com https://poe.com https://*.poe.com; img-src 'self' data: https: http:; connect-src 'self' https: wss:;"
+      "csp": "default-src * 'self' 'unsafe-inline' 'unsafe-eval' data: blob: filesystem: about: ws: wss:; style-src * 'self' 'unsafe-inline'; script-src * 'self' 'unsafe-inline' 'unsafe-eval'; img-src * 'self' data: blob:; font-src * 'self' data:; connect-src * 'self' https: wss:; frame-src * 'self' data:;"
     },
     "windows": [
       {
@@ -21,19 +21,12 @@
         "title": "Gemini",
         "width": 1440,
         "url": "https://gemini.google.com/app",
-        "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-        "label": "gemini"
-      },
-      {
-        "fullscreen": false,
-        "height": 1080,
-        "resizable": true,
-        "title": "Poe",
-        "width": 1440,
-        "url": "https://poe.com",
-        "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-        "label": "poe",
-        "visible": false
+        "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "acceptFirstMouse": true,
+        "additionalBrowserArgs": "--disable-blink-features=AutomationControlled --disable-features=IsolateOrigins,site-per-process --disable-site-isolation-trials --disable-web-security --allow-running-insecure-content --disable-blink-features=AutomationControlled",
+        "label": "gemini",
+        "decorations": true,
+        "center": true
       }
     ]
   },

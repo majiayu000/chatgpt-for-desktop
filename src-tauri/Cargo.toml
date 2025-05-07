@@ -24,6 +24,7 @@ serde = { version = "1.0.219", features = ["derive"] }
 tauri = { version = "2.5.1", features = ["native-tls", "tray-icon"] }
 webbrowser = "1.0.4"
 tauri-plugin-http = "2.4.3"
+tauri-plugin-store = "2.0.0"
 image = "0.24.7"
 
 [features]

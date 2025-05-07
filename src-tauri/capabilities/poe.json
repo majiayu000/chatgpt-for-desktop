@@ -1,0 +1,18 @@
+{
+  "identifier": "poe",
+  "description": "Poe capabilities",
+  "permissions": [
+    {
+      "identifier": "http:default",
+      "allow": [
+        {
+          "url": "https://*.poe.com"
+        },
+        {
+          "url": "https://poe.com"
+        }
+      ]
+    },
+    "core:webview:default"
+  ]
+}
