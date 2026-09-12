@@ -3,10 +3,12 @@
   windows_subsystem = "windows"
 )]
 
+mod credentials_manager;
+
+use credentials_manager::Credentials;
 use tauri::{Manager, WindowEvent};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use serde::{Serialize, Deserialize};
 use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
@@ -32,65 +34,6 @@ impl Default for AppState {
             last_tray_click_time: Instant::now(),
         }
     }
-}
-
-// 定义凭证结构体
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct Credentials {
-    username: String,
-    password: String,
-    service: String,
-}
-
-// 保存凭证
-fn save_credentials_to_file(service: &str, username: &str, password: &str) -> Result<(), String> {
-    // 简单地将凭证保存到文件中
-    let credentials = Credentials {
-        username: username.to_string(),
-        password: password.to_string(),
-        service: service.to_string(),
-    };
-
-    let json = serde_json::to_string(&credentials).map_err(|e| e.to_string())?;
-
-    // 创建目录（如果不存在）
-    fs::create_dir_all("credentials").map_err(|e| e.to_string())?;
-
-    // 保存到文件
-    fs::write(format!("credentials/{}.json", service), json).map_err(|e| e.to_string())?;
-
-    Ok(())
-}
-
-// 获取凭证
-fn get_credentials_from_file(service: &str) -> Result<Option<Credentials>, String> {
-    let path = format!("credentials/{}.json", service);
-
-    // 检查文件是否存在
-    if !Path::new(&path).exists() {
-        return Ok(None);
-    }
-
-    // 读取文件
-    let json = fs::read_to_string(path).map_err(|e| e.to_string())?;
-
-    // 解析 JSON
-    let credentials: Credentials = serde_json::from_str(&json).map_err(|e| e.to_string())?;
-
-    Ok(Some(credentials))
-}
-
-// 删除凭证
-fn delete_credentials_from_file(service: &str) -> Result<(), String> {
-    let path = format!("credentials/{}.json", service);
-
-    // 检查文件是否存在
-    if Path::new(&path).exists() {
-        // 删除文件
-        fs::remove_file(path).map_err(|e| e.to_string())?;
-    }
-
-    Ok(())
 }
 
 // 生成自动登录脚本
@@ -150,22 +93,22 @@ fn generate_login_script(service: &str, username: &str, password: &str) -> Strin
     }
 }
 
-// 定义命令：保存凭证
+// 定义命令：保存凭证（OS keychain；never writes plaintext passwords to disk）
 #[tauri::command]
 fn save_credentials(service: String, username: String, password: String) -> Result<(), String> {
-    save_credentials_to_file(&service, &username, &password)
+    credentials_manager::save_credentials(&service, &username, &password)
 }
 
-// 定义命令：获取凭证
+// 定义命令：获取凭证（keychain with one-time legacy JSON migration）
 #[tauri::command]
 fn get_credentials(service: String) -> Result<Option<Credentials>, String> {
-    get_credentials_from_file(&service)
+    credentials_manager::get_credentials(&service)
 }
 
-// 定义命令：删除凭证
+// 定义命令：删除凭证（keychain + leftover plaintext files）
 #[tauri::command]
 fn delete_credentials(service: String) -> Result<(), String> {
-    delete_credentials_from_file(&service)
+    credentials_manager::delete_credentials(&service)
 }
 
 // 加载浏览器模拟脚本
@@ -192,8 +135,8 @@ fn load_browser_emulation_script() -> Result<String, String> {
 // 定义命令：自动登录
 #[tauri::command]
 fn auto_login(window: tauri::WebviewWindow, service: String) -> Result<bool, String> {
-    // 获取凭证
-    if let Ok(Some(creds)) = get_credentials_from_file(&service) {
+    // 获取凭证（keychain / migrated legacy file）
+    if let Ok(Some(creds)) = credentials_manager::get_credentials(&service) {
         // 生成登录脚本
         let script = generate_login_script(&service, &creds.username, &creds.password);
 

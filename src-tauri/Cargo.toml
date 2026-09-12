@@ -26,6 +26,10 @@ webbrowser = "1.0.4"
 tauri-plugin-http = "2.4.3"
 tauri-plugin-store = "2.0.0"
 image = "0.24.7"
+keyring = "3.6.2"
+
+[dev-dependencies]
+tempfile = "3.14.0"
 
 [features]
 # by default Tauri runs in production mode
