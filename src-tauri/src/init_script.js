@@ -4,18 +4,22 @@
 // ==================== 基本属性模拟 ====================
 
 // 禁用webdriver标志
+// configurable: true so browser_emulation.js can redefine these on focus
 Object.defineProperty(navigator, 'webdriver', {
-    get: () => false
+    get: () => false,
+    configurable: true
 });
 
 // 设置标准的 vendor
 Object.defineProperty(navigator, 'vendor', {
-    get: () => 'Google Inc.'
+    get: () => 'Google Inc.',
+    configurable: true
 });
 
 // 设置标准的 productSub
 Object.defineProperty(navigator, 'productSub', {
-    get: () => '20030107'
+    get: () => '20030107',
+    configurable: true
 });
 
 // ==================== Chrome 对象模拟 ====================
