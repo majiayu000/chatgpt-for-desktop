@@ -23,7 +23,7 @@
         "url": "https://gemini.google.com/app",
         "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
         "acceptFirstMouse": true,
-        "additionalBrowserArgs": "--disable-blink-features=AutomationControlled --disable-features=IsolateOrigins,site-per-process --disable-site-isolation-trials --disable-web-security --allow-running-insecure-content --disable-blink-features=AutomationControlled",
+        "additionalBrowserArgs": "--disable-blink-features=AutomationControlled",
         "label": "gemini",
         "decorations": true,
         "center": true

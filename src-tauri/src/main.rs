@@ -343,7 +343,7 @@ fn main() {
                   .fullscreen(false)
                   .inner_size(1440.0, 1080.0)
                   .user_agent(user_agent)
-                  .additional_browser_args("--disable-blink-features=AutomationControlled --disable-features=IsolateOrigins,site-per-process --disable-site-isolation-trials --disable-web-security --allow-running-insecure-content --disable-blink-features=AutomationControlled")
+                  .additional_browser_args("--disable-blink-features=AutomationControlled")
                   .build() {
 
                   let _ = window.set_focus();
