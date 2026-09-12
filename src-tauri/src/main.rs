@@ -8,10 +8,56 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use serde::{Serialize, Deserialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 use std::io::Read;
+
+const ALLOWED_CREDENTIAL_SERVICES: &[&str] = &["gemini", "poe"];
+
+/// Allowlist credential `service` names used for filesystem paths.
+/// Rejects empty values, path separators, `..`, and anything outside the known UI services.
+fn validate_service_name(service: &str) -> Result<&str, String> {
+    if service.is_empty() {
+        return Err("Invalid service name: empty".to_string());
+    }
+    if service.contains('/') || service.contains('\\') || service.contains("..") {
+        return Err("Invalid service name: path characters not allowed".to_string());
+    }
+    if !ALLOWED_CREDENTIAL_SERVICES.contains(&service) {
+        return Err(format!("Unsupported service: {}", service));
+    }
+    Ok(service)
+}
+
+/// Build a path under a fixed `credentials/` base with canonicalize + prefix containment.
+fn credentials_file_path(service: &str) -> Result<PathBuf, String> {
+    let service = validate_service_name(service)?;
+
+    fs::create_dir_all("credentials").map_err(|e| e.to_string())?;
+
+    let base = Path::new("credentials")
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve credentials directory: {}", e))?;
+
+    let path = base.join(format!("{}.json", service));
+
+    // Defense in depth: resolved path must remain under the credentials base.
+    if path.exists() {
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| format!("Failed to resolve credentials path: {}", e))?;
+        if !canonical.starts_with(&base) {
+            return Err("Path traversal detected".to_string());
+        }
+        Ok(canonical)
+    } else {
+        if path.parent() != Some(base.as_path()) {
+            return Err("Path traversal detected".to_string());
+        }
+        Ok(path)
+    }
+}
 
 // 定义应用状态结构体
 struct AppState {
@@ -44,7 +90,8 @@ struct Credentials {
 
 // 保存凭证
 fn save_credentials_to_file(service: &str, username: &str, password: &str) -> Result<(), String> {
-    // 简单地将凭证保存到文件中
+    let path = credentials_file_path(service)?;
+
     let credentials = Credentials {
         username: username.to_string(),
         password: password.to_string(),
@@ -52,29 +99,20 @@ fn save_credentials_to_file(service: &str, username: &str, password: &str) -> Re
     };
 
     let json = serde_json::to_string(&credentials).map_err(|e| e.to_string())?;
-
-    // 创建目录（如果不存在）
-    fs::create_dir_all("credentials").map_err(|e| e.to_string())?;
-
-    // 保存到文件
-    fs::write(format!("credentials/{}.json", service), json).map_err(|e| e.to_string())?;
+    fs::write(path, json).map_err(|e| e.to_string())?;
 
     Ok(())
 }
 
 // 获取凭证
 fn get_credentials_from_file(service: &str) -> Result<Option<Credentials>, String> {
-    let path = format!("credentials/{}.json", service);
+    let path = credentials_file_path(service)?;
 
-    // 检查文件是否存在
-    if !Path::new(&path).exists() {
+    if !path.exists() {
         return Ok(None);
     }
 
-    // 读取文件
     let json = fs::read_to_string(path).map_err(|e| e.to_string())?;
-
-    // 解析 JSON
     let credentials: Credentials = serde_json::from_str(&json).map_err(|e| e.to_string())?;
 
     Ok(Some(credentials))
@@ -82,11 +120,9 @@ fn get_credentials_from_file(service: &str) -> Result<Option<Credentials>, Strin
 
 // 删除凭证
 fn delete_credentials_from_file(service: &str) -> Result<(), String> {
-    let path = format!("credentials/{}.json", service);
+    let path = credentials_file_path(service)?;
 
-    // 检查文件是否存在
-    if Path::new(&path).exists() {
-        // 删除文件
+    if path.exists() {
         fs::remove_file(path).map_err(|e| e.to_string())?;
     }
 
@@ -192,6 +228,8 @@ fn load_browser_emulation_script() -> Result<String, String> {
 // 定义命令：自动登录
 #[tauri::command]
 fn auto_login(window: tauri::WebviewWindow, service: String) -> Result<bool, String> {
+    validate_service_name(&service)?;
+
     // 获取凭证
     if let Ok(Some(creds)) = get_credentials_from_file(&service) {
         // 生成登录脚本
@@ -514,4 +552,52 @@ fn main() {
     })
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_service_name_accepts_allowed() {
+        assert_eq!(validate_service_name("gemini").unwrap(), "gemini");
+        assert_eq!(validate_service_name("poe").unwrap(), "poe");
+    }
+
+    #[test]
+    fn validate_service_name_rejects_empty() {
+        assert!(validate_service_name("").is_err());
+    }
+
+    #[test]
+    fn validate_service_name_rejects_path_traversal() {
+        assert!(validate_service_name("../../tmp/evil").is_err());
+        assert!(validate_service_name("foo/bar").is_err());
+        assert!(validate_service_name("foo\\bar").is_err());
+        assert!(validate_service_name("..").is_err());
+        assert!(validate_service_name("../gemini").is_err());
+    }
+
+    #[test]
+    fn validate_service_name_rejects_unknown() {
+        assert!(validate_service_name("chatgpt").is_err());
+        assert!(validate_service_name("evil").is_err());
+    }
+
+    #[test]
+    fn credentials_file_path_stays_under_credentials_dir() {
+        let path = credentials_file_path("gemini").expect("gemini should be allowed");
+        let base = Path::new("credentials")
+            .canonicalize()
+            .expect("credentials dir should exist after path build");
+        assert!(path.starts_with(&base));
+        assert_eq!(path.file_name().and_then(|n| n.to_str()), Some("gemini.json"));
+    }
+
+    #[test]
+    fn credentials_file_path_rejects_traversal_samples() {
+        assert!(credentials_file_path("../../tmp/evil").is_err());
+        assert!(credentials_file_path("foo/bar").is_err());
+        assert!(credentials_file_path("").is_err());
+    }
 }

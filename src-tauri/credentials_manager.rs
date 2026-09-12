@@ -1,6 +1,51 @@
 use serde::{Serialize, Deserialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+const ALLOWED_CREDENTIAL_SERVICES: &[&str] = &["gemini", "poe"];
+
+/// Allowlist credential `service` names used for filesystem paths.
+/// Rejects empty values, path separators, `..`, and anything outside the known UI services.
+fn validate_service_name(service: &str) -> Result<&str, String> {
+    if service.is_empty() {
+        return Err("Invalid service name: empty".to_string());
+    }
+    if service.contains('/') || service.contains('\\') || service.contains("..") {
+        return Err("Invalid service name: path characters not allowed".to_string());
+    }
+    if !ALLOWED_CREDENTIAL_SERVICES.contains(&service) {
+        return Err(format!("Unsupported service: {}", service));
+    }
+    Ok(service)
+}
+
+/// Build a path under a fixed `credentials/` base with canonicalize + prefix containment.
+fn credentials_file_path(service: &str) -> Result<PathBuf, String> {
+    let service = validate_service_name(service)?;
+
+    fs::create_dir_all("credentials").map_err(|e| e.to_string())?;
+
+    let base = Path::new("credentials")
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve credentials directory: {}", e))?;
+
+    let path = base.join(format!("{}.json", service));
+
+    if path.exists() {
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| format!("Failed to resolve credentials path: {}", e))?;
+        if !canonical.starts_with(&base) {
+            return Err("Path traversal detected".to_string());
+        }
+        Ok(canonical)
+    } else {
+        if path.parent() != Some(base.as_path()) {
+            return Err("Path traversal detected".to_string());
+        }
+        Ok(path)
+    }
+}
 
 // 定义凭证结构体
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -16,21 +61,17 @@ pub fn save_credentials(
     username: &str,
     password: &str,
 ) -> Result<(), String> {
-    // 简单地将凭证保存到文件中
+    let path = credentials_file_path(service)?;
+
     let credentials = Credentials {
         username: username.to_string(),
         password: password.to_string(),
         service: service.to_string(),
     };
-    
+
     let json = serde_json::to_string(&credentials).map_err(|e| e.to_string())?;
-    
-    // 创建目录（如果不存在）
-    fs::create_dir_all("credentials").map_err(|e| e.to_string())?;
-    
-    // 保存到文件
-    fs::write(format!("credentials/{}.json", service), json).map_err(|e| e.to_string())?;
-    
+    fs::write(path, json).map_err(|e| e.to_string())?;
+
     Ok(())
 }
 
@@ -38,19 +79,15 @@ pub fn save_credentials(
 pub fn get_credentials(
     service: &str,
 ) -> Result<Option<Credentials>, String> {
-    let path = format!("credentials/{}.json", service);
-    
-    // 检查文件是否存在
-    if !Path::new(&path).exists() {
+    let path = credentials_file_path(service)?;
+
+    if !path.exists() {
         return Ok(None);
     }
-    
-    // 读取文件
+
     let json = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    
-    // 解析 JSON
     let credentials: Credentials = serde_json::from_str(&json).map_err(|e| e.to_string())?;
-    
+
     Ok(Some(credentials))
 }
 
@@ -58,14 +95,12 @@ pub fn get_credentials(
 pub fn delete_credentials(
     service: &str,
 ) -> Result<(), String> {
-    let path = format!("credentials/{}.json", service);
-    
-    // 检查文件是否存在
-    if Path::new(&path).exists() {
-        // 删除文件
+    let path = credentials_file_path(service)?;
+
+    if path.exists() {
         fs::remove_file(path).map_err(|e| e.to_string())?;
     }
-    
+
     Ok(())
 }
 
@@ -75,6 +110,8 @@ pub fn generate_login_script(
     username: &str,
     password: &str,
 ) -> Result<String, String> {
+    validate_service_name(service)?;
+
     // 根据服务类型执行不同的登录脚本
     let script = match service {
         "gemini" => format!(
@@ -129,6 +166,24 @@ pub fn generate_login_script(
         ),
         _ => return Err("不支持的服务类型".to_string()),
     };
-    
+
     Ok(script)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_service_name_accepts_allowed() {
+        assert_eq!(validate_service_name("gemini").unwrap(), "gemini");
+        assert_eq!(validate_service_name("poe").unwrap(), "poe");
+    }
+
+    #[test]
+    fn validate_service_name_rejects_traversal() {
+        assert!(validate_service_name("").is_err());
+        assert!(validate_service_name("../../tmp/evil").is_err());
+        assert!(validate_service_name("foo/bar").is_err());
+    }
 }
