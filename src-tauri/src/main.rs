@@ -3,6 +3,8 @@
   windows_subsystem = "windows"
 )]
 
+mod webview_handler;
+
 use tauri::{Manager, WindowEvent};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -226,6 +228,8 @@ fn inject_browser_emulation(window: tauri::WebviewWindow) -> Result<bool, String
 fn main() {
   tauri::Builder::default()
     .plugin(tauri_plugin_http::init())
+    // Register early init_script.js injection; inject_browser_emulation remains the late complementary path.
+    .plugin(webview_handler::WebviewHandler)
     .manage(Mutex::new(AppState::default()))
     .invoke_handler(tauri::generate_handler![
       save_credentials,
