@@ -186,31 +186,58 @@
                 
                 // 将凭证添加到列表中
                 function addCredentialToList(service, username) {
+                    // Only trust the static service enum for data-service attributes.
+                    const trustedService = service === 'gemini' || service === 'poe' ? service : null;
+                    if (!trustedService) {
+                        return;
+                    }
+
                     const item = document.createElement('div');
                     item.className = 'credential-item';
-                    
-                    const serviceName = service === 'gemini' ? 'Gemini' : 'Poe';
-                    
-                    item.innerHTML = `
-                        <div class="credential-info">
-                            <strong>${serviceName}</strong>: ${username}
-                        </div>
-                        <div class="credential-actions">
-                            <button class="load-btn" data-service="${service}">加载</button>
-                            <button class="delete-btn" data-service="${service}">删除</button>
-                        </div>
-                    `;
-                    
+
+                    const serviceName = trustedService === 'gemini' ? 'Gemini' : 'Poe';
+
+                    const info = document.createElement('div');
+                    info.className = 'credential-info';
+
+                    const strong = document.createElement('strong');
+                    strong.textContent = serviceName;
+                    info.appendChild(strong);
+                    info.appendChild(document.createTextNode(': '));
+
+                    const usernameText = document.createElement('span');
+                    usernameText.textContent = username;
+                    info.appendChild(usernameText);
+
+                    const actions = document.createElement('div');
+                    actions.className = 'credential-actions';
+
+                    const loadBtn = document.createElement('button');
+                    loadBtn.className = 'load-btn';
+                    loadBtn.dataset.service = trustedService;
+                    loadBtn.textContent = '加载';
+
+                    const deleteBtn = document.createElement('button');
+                    deleteBtn.className = 'delete-btn';
+                    deleteBtn.dataset.service = trustedService;
+                    deleteBtn.textContent = '删除';
+
+                    actions.appendChild(loadBtn);
+                    actions.appendChild(deleteBtn);
+
+                    item.appendChild(info);
+                    item.appendChild(actions);
+
                     // 添加事件监听器
-                    item.querySelector('.load-btn').addEventListener('click', () => {
-                        serviceSelect.value = service;
+                    loadBtn.addEventListener('click', () => {
+                        serviceSelect.value = trustedService;
                         loadSelectedCredential();
                     });
-                    
-                    item.querySelector('.delete-btn').addEventListener('click', async () => {
-                        await deleteCredential(service);
+
+                    deleteBtn.addEventListener('click', async () => {
+                        await deleteCredential(trustedService);
                     });
-                    
+
                     credentialsList.appendChild(item);
                 }
                 
