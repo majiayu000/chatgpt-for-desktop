@@ -70,11 +70,16 @@ pub fn delete_credentials(
 }
 
 // 生成自动登录脚本
+// Credentials are embedded as JSON string literals so quotes/backslashes/newlines
+// cannot break out of the JS assigned to window.eval (SEC-03).
 pub fn generate_login_script(
     service: &str,
     username: &str,
     password: &str,
 ) -> Result<String, String> {
+    let username_js = serde_json::to_string(username).map_err(|e| e.to_string())?;
+    let password_js = serde_json::to_string(password).map_err(|e| e.to_string())?;
+
     // 根据服务类型执行不同的登录脚本
     let script = match service {
         "gemini" => format!(
@@ -86,9 +91,9 @@ pub fn generate_login_script(
                 const loginButton = document.querySelector('button[type="submit"]');
                 
                 if (emailInput && passwordInput && loginButton) {{
-                    // 填充凭证
-                    emailInput.value = "{}";
-                    passwordInput.value = "{}";
+                    // 填充凭证 (JSON-encoded literals)
+                    emailInput.value = {};
+                    passwordInput.value = {};
                     
                     // 点击登录按钮
                     setTimeout(() => {{
@@ -100,7 +105,7 @@ pub fn generate_login_script(
                 return false;
             }})()
             "#,
-            username, password
+            username_js, password_js
         ),
         "poe" => format!(
             r#"
@@ -111,9 +116,9 @@ pub fn generate_login_script(
                 const loginButton = document.querySelector('button[type="submit"]');
                 
                 if (emailInput && passwordInput && loginButton) {{
-                    // 填充凭证
-                    emailInput.value = "{}";
-                    passwordInput.value = "{}";
+                    // 填充凭证 (JSON-encoded literals)
+                    emailInput.value = {};
+                    passwordInput.value = {};
                     
                     // 点击登录按钮
                     setTimeout(() => {{
@@ -125,10 +130,35 @@ pub fn generate_login_script(
                 return false;
             }})()
             "#,
-            username, password
+            username_js, password_js
         ),
         _ => return Err("不支持的服务类型".to_string()),
     };
     
     Ok(script)
+}
+
+#[cfg(test)]
+mod generate_login_script_tests {
+    use super::generate_login_script;
+
+    #[test]
+    fn embeds_credentials_as_json_string_literals() {
+        let script = generate_login_script(
+            "gemini",
+            r#"user"name\with</script>"#,
+            "pass\nword\\and\"quote",
+        )
+        .expect("gemini script");
+
+        assert!(
+            script.contains(r#"emailInput.value = "user\"name\\with</script>";"#),
+            "username must be a closed JSON string literal: {script}"
+        );
+        assert!(
+            script.contains(r#"passwordInput.value = "pass\nword\\and\"quote";"#),
+            "password must be a closed JSON string literal: {script}"
+        );
+        assert!(script.trim_end().ends_with("})()"));
+    }
 }

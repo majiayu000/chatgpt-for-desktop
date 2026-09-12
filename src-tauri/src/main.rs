@@ -94,7 +94,13 @@ fn delete_credentials_from_file(service: &str) -> Result<(), String> {
 }
 
 // 生成自动登录脚本
+// Credentials are embedded as JSON string literals so quotes/backslashes/newlines
+// cannot break out of the JS assigned to window.eval (SEC-03).
 fn generate_login_script(service: &str, username: &str, password: &str) -> String {
+    // serde_json::to_string on &str always yields a quoted, escaped JS-safe literal.
+    let username_js = serde_json::to_string(username).expect("string serialization cannot fail");
+    let password_js = serde_json::to_string(password).expect("string serialization cannot fail");
+
     match service {
         "gemini" => format!(
             r#"
@@ -105,9 +111,9 @@ fn generate_login_script(service: &str, username: &str, password: &str) -> Strin
                 const loginButton = document.querySelector('button[type="submit"]');
 
                 if (emailInput && passwordInput && loginButton) {{
-                    // 填充凭证
-                    emailInput.value = "{}";
-                    passwordInput.value = "{}";
+                    // 填充凭证 (JSON-encoded literals)
+                    emailInput.value = {};
+                    passwordInput.value = {};
 
                     // 点击登录按钮
                     setTimeout(() => {{
@@ -119,7 +125,7 @@ fn generate_login_script(service: &str, username: &str, password: &str) -> Strin
                 return false;
             }})()
             "#,
-            username, password
+            username_js, password_js
         ),
         "poe" => format!(
             r#"
@@ -130,9 +136,9 @@ fn generate_login_script(service: &str, username: &str, password: &str) -> Strin
                 const loginButton = document.querySelector('button[type="submit"]');
 
                 if (emailInput && passwordInput && loginButton) {{
-                    // 填充凭证
-                    emailInput.value = "{}";
-                    passwordInput.value = "{}";
+                    // 填充凭证 (JSON-encoded literals)
+                    emailInput.value = {};
+                    passwordInput.value = {};
 
                     // 点击登录按钮
                     setTimeout(() => {{
@@ -144,9 +150,44 @@ fn generate_login_script(service: &str, username: &str, password: &str) -> Strin
                 return false;
             }})()
             "#,
-            username, password
+            username_js, password_js
         ),
         _ => String::from("console.log('不支持的服务类型');"),
+    }
+}
+
+#[cfg(test)]
+mod generate_login_script_tests {
+    use super::generate_login_script;
+
+    #[test]
+    fn embeds_credentials_as_json_string_literals() {
+        let script = generate_login_script(
+            "gemini",
+            r#"user"name\with</script>"#,
+            "pass\nword\\and\"quote",
+        );
+
+        assert!(
+            script.contains(r#"emailInput.value = "user\"name\\with</script>";"#),
+            "username must be a closed JSON string literal: {script}"
+        );
+        assert!(
+            script.contains(r#"passwordInput.value = "pass\nword\\and\"quote";"#),
+            "password must be a closed JSON string literal: {script}"
+        );
+        // Raw unescaped quote/backslash/newline must not appear as breakouts.
+        assert!(!script.contains(r#"emailInput.value = "user"name"#));
+        assert!(!script.contains("passwordInput.value = \"pass\nword"));
+        assert!(script.trim_end().ends_with("})()"));
+    }
+
+    #[test]
+    fn poe_script_also_json_encodes() {
+        let script = generate_login_script("poe", "a\"b", "c\\d");
+        assert!(script.contains(r#"emailInput.value = "a\"b";"#));
+        assert!(script.contains(r#"passwordInput.value = "c\\d";"#));
+        assert!(script.trim_end().ends_with("})()"));
     }
 }
 
