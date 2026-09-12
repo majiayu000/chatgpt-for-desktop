@@ -19,9 +19,6 @@
         },
         {
           "url": "https://*.googleapis.com"
-        },
-        {
-          "url": "https://*"
         }
       ]
     },
