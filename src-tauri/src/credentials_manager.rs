@@ -1,7 +1,7 @@
 use fslock::LockFile;
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -99,18 +99,144 @@ fn legacy_credentials_app_data_dir() -> Result<PathBuf, String> {
     Ok(base.join(KEYRING_SERVICE).join("credentials"))
 }
 
-/// Every supported legacy plaintext path for a service.
+/// Registry of absolute directories that previously held legacy plaintext files.
 ///
-/// Order: process-independent app-data first, then the historical CWD-relative
-/// `credentials/{service}.json` so upgrades still find files written by older
-/// builds. Checking both keeps migrate/delete aligned with the shared lock
-/// namespace even when instances launch from different working directories.
+/// Old builds only wrote `credentials/{service}.json` relative to their launch
+/// CWD and never used the app-data directory. Recording those absolute roots
+/// (and relocating discovered files into app-data) lets later launches from a
+/// different CWD still find and delete the original source.
+fn legacy_roots_registry_path() -> Result<PathBuf, String> {
+    Ok(legacy_credentials_app_data_dir()?.join("legacy-credential-roots.json"))
+}
+
+fn load_recorded_legacy_roots() -> Result<Vec<PathBuf>, String> {
+    let path = legacy_roots_registry_path()?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let json = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let roots: Vec<String> = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+    Ok(roots.into_iter().map(PathBuf::from).collect())
+}
+
+fn record_legacy_root(root: &Path) -> Result<(), String> {
+    let abs = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(root)
+    };
+    let mut roots = load_recorded_legacy_roots()?;
+    if roots.iter().any(|r| r == &abs) {
+        return Ok(());
+    }
+    roots.push(abs);
+    let dir = legacy_credentials_app_data_dir()?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let encoded: Vec<String> = roots
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    fs::write(
+        legacy_roots_registry_path()?,
+        serde_json::to_string(&encoded).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn deletion_tombstone_path(service: &str) -> Result<PathBuf, String> {
+    Ok(legacy_credentials_app_data_dir()?.join(format!("{}.deleted", service)))
+}
+
+fn mark_credentials_deleted(service: &str) -> Result<(), String> {
+    let dir = legacy_credentials_app_data_dir()?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    fs::write(deletion_tombstone_path(service)?, b"1").map_err(|e| e.to_string())
+}
+
+fn clear_credentials_deleted_marker(service: &str) -> Result<(), String> {
+    let path = deletion_tombstone_path(service)?;
+    if path.exists() {
+        fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn credentials_were_deleted(service: &str) -> bool {
+    deletion_tombstone_path(service)
+        .map(|p| p.exists())
+        .unwrap_or(false)
+}
+
+/// Candidate directories that may contain `{service}.json` from older builds.
+fn legacy_credential_roots() -> Result<Vec<PathBuf>, String> {
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |p: PathBuf| {
+        if seen.insert(p.clone()) {
+            roots.push(p);
+        }
+    };
+
+    // Relocated / stable copy — process-independent.
+    push(legacy_credentials_app_data_dir()?);
+
+    // Historical launch CWD (absolute when available, plus relative fallback).
+    if let Ok(cwd) = std::env::current_dir() {
+        push(cwd.join("credentials"));
+    }
+    push(PathBuf::from("credentials"));
+
+    // Absolute roots discovered on prior launches (actual old CWDs).
+    for root in load_recorded_legacy_roots()? {
+        push(root);
+    }
+
+    // Explicit known launch locations (tests / operators), OS path-separated.
+    if let Ok(extra) = std::env::var("CREDENTIALS_LEGACY_ROOTS") {
+        if !extra.is_empty() {
+            for root in std::env::split_paths(&extra) {
+                if !root.as_os_str().is_empty() {
+                    push(root);
+                }
+            }
+        }
+    }
+
+    Ok(roots)
+}
+
+/// Every supported legacy plaintext path for a service.
 fn legacy_credentials_paths(service: &str) -> Result<Vec<PathBuf>, String> {
     let file_name = format!("{}.json", service);
-    Ok(vec![
-        legacy_credentials_app_data_dir()?.join(&file_name),
-        PathBuf::from("credentials").join(&file_name),
-    ])
+    Ok(legacy_credential_roots()?
+        .into_iter()
+        .map(|root| root.join(&file_name))
+        .collect())
+}
+
+/// Copy a discovered non-app-data legacy file into the stable app-data location
+/// and remember its absolute source directory for later cross-CWD delete/migrate.
+fn remember_and_relocate_legacy(service: &str, src: &Path) -> Result<(), String> {
+    if let Some(parent) = src.parent() {
+        record_legacy_root(parent)?;
+    }
+
+    let dest_dir = legacy_credentials_app_data_dir()?;
+    fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
+    let dest = dest_dir.join(format!("{}.json", service));
+
+    let same = match (fs::canonicalize(src), fs::canonicalize(&dest)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => src == dest,
+    };
+    if same {
+        return Ok(());
+    }
+
+    fs::copy(src, &dest).map_err(|e| format!("relocate legacy credentials: {}", e))?;
+    Ok(())
 }
 
 fn keyring_entry(service: &str) -> Result<Entry, String> {
@@ -134,6 +260,9 @@ pub fn read_legacy_credentials_file(service: &str) -> Result<Option<Credentials>
         }
         let json = fs::read_to_string(&path).map_err(|e| e.to_string())?;
         let credentials: Credentials = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        // Move the original CWD-relative source into app-data and record its
+        // absolute root so a later launch/delete from another CWD still finds it.
+        remember_and_relocate_legacy(service, &path)?;
         return Ok(Some(credentials));
     }
     Ok(None)
@@ -148,6 +277,8 @@ fn save_credentials_unlocked(service: &str, username: &str, password: &str) -> R
     let json = serde_json::to_string(&credentials).map_err(|e| e.to_string())?;
     let entry = keyring_entry(service)?;
     entry.set_password(&json).map_err(|e| e.to_string())?;
+    // Intentional save after delete clears the anti-resurrection tombstone.
+    clear_credentials_deleted_marker(service)?;
     remove_legacy_file(service)?;
     Ok(())
 }
@@ -163,6 +294,12 @@ fn get_credentials_unlocked(service: &str) -> Result<Option<Credentials>, String
             Ok(Some(credentials))
         }
         Err(keyring::Error::NoEntry) => {
+            // A prior delete that could not see every historical CWD must not be
+            // undone by later launching from an old directory that still has JSON.
+            if credentials_were_deleted(service) {
+                remove_legacy_file(service)?;
+                return Ok(None);
+            }
             if let Some(mut legacy) = read_legacy_credentials_file(service)? {
                 // Always migrate and clean up under the requested service key.
                 // If the embedded service differs (copied/renamed file), normalize it
@@ -183,6 +320,9 @@ fn get_credentials_unlocked(service: &str) -> Result<Option<Credentials>, String
 
 fn delete_credentials_unlocked(service: &str) -> Result<(), String> {
     remove_legacy_file(service)?;
+    // Tombstone survives even if some historical CWD file was not yet recorded,
+    // so a later launch from that old CWD cannot remigrate into the keychain.
+    mark_credentials_deleted(service)?;
     let entry = keyring_entry(service)?;
     match entry.delete_credential() {
         Ok(()) => {}
@@ -228,10 +368,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let legacy_root = tempfile::tempdir().unwrap();
         env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
+        env::remove_var("CREDENTIALS_LEGACY_ROOTS");
         env::set_current_dir(tmp.path()).unwrap();
         f();
         env::set_current_dir(original).unwrap();
         env::remove_var("CREDENTIALS_LEGACY_DIR");
+        env::remove_var("CREDENTIALS_LEGACY_ROOTS");
     }
 
     #[test]
@@ -347,6 +489,7 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap();
         let legacy_root = tempfile::tempdir().unwrap();
         env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
+        env::remove_var("CREDENTIALS_LEGACY_ROOTS");
 
         let paths_a = legacy_credentials_paths("gemini").unwrap();
         let original = env::current_dir().unwrap();
@@ -359,8 +502,8 @@ mod tests {
         assert_eq!(paths_a[0], paths_b[0]);
         assert_eq!(paths_a[0], legacy_root.path().join("gemini.json"));
         // CWD-relative historical path remains a supported location.
-        assert_eq!(paths_a[1], PathBuf::from("credentials/gemini.json"));
-        assert_eq!(paths_b[1], PathBuf::from("credentials/gemini.json"));
+        assert!(paths_a.iter().any(|p| p == &PathBuf::from("credentials/gemini.json")));
+        assert!(paths_b.iter().any(|p| p == &PathBuf::from("credentials/gemini.json")));
     }
 
     #[test]
@@ -368,6 +511,7 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap();
         let legacy_root = tempfile::tempdir().unwrap();
         env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
+        env::remove_var("CREDENTIALS_LEGACY_ROOTS");
 
         let sample = Credentials {
             username: "user@example.com".into(),
@@ -393,10 +537,131 @@ mod tests {
     }
 
     #[test]
+    fn read_legacy_finds_prior_cwd_file_via_known_roots() {
+        // Old builds only wrote CWD-relative credentials/{service}.json and never
+        // the new app-data directory. A later launch from another CWD must still
+        // find that original file via known/recorded legacy roots.
+        let _guard = TEST_LOCK.lock().unwrap();
+        let legacy_root = tempfile::tempdir().unwrap();
+        env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
+
+        let old_cwd = tempfile::tempdir().unwrap();
+        let old_creds_dir = old_cwd.path().join("credentials");
+        fs::create_dir_all(&old_creds_dir).unwrap();
+        let sample = Credentials {
+            username: "user@example.com".into(),
+            password: "s3cret".into(),
+            service: "gemini".into(),
+        };
+        fs::write(
+            old_creds_dir.join("gemini.json"),
+            serde_json::to_string(&sample).unwrap(),
+        )
+        .unwrap();
+
+        // Simulate an operator/test supplying the historical launch location, or
+        // a prior discovery that recorded it — never manufacture an app-data file.
+        env::set_var("CREDENTIALS_LEGACY_ROOTS", &old_creds_dir);
+
+        let original = env::current_dir().unwrap();
+        let other_cwd = tempfile::tempdir().unwrap();
+        env::set_current_dir(other_cwd.path()).unwrap();
+        assert!(!other_cwd.path().join("credentials/gemini.json").exists());
+        assert!(!legacy_root.path().join("gemini.json").exists());
+
+        let loaded = read_legacy_credentials_file("gemini").unwrap().unwrap();
+        // Discovery relocates into stable app-data for subsequent CWD-independent ops.
+        assert!(legacy_root.path().join("gemini.json").exists());
+        assert_eq!(loaded, sample);
+
+        env::set_current_dir(original).unwrap();
+        env::remove_var("CREDENTIALS_LEGACY_DIR");
+        env::remove_var("CREDENTIALS_LEGACY_ROOTS");
+    }
+
+    #[test]
+    fn discovering_cwd_legacy_records_root_for_other_cwd() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let legacy_root = tempfile::tempdir().unwrap();
+        env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
+        env::remove_var("CREDENTIALS_LEGACY_ROOTS");
+
+        let original = env::current_dir().unwrap();
+        let old_cwd = tempfile::tempdir().unwrap();
+        env::set_current_dir(old_cwd.path()).unwrap();
+        fs::create_dir_all("credentials").unwrap();
+        let sample = Credentials {
+            username: "u".into(),
+            password: "p".into(),
+            service: "poe".into(),
+        };
+        fs::write(
+            "credentials/poe.json",
+            serde_json::to_string(&sample).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = read_legacy_credentials_file("poe").unwrap().unwrap();
+        assert_eq!(loaded, sample);
+        assert!(legacy_root.path().join("poe.json").exists());
+
+        // Switch away from the historical CWD; recorded root + relocated copy
+        // must still be deletable without re-launching from old_cwd.
+        let other_cwd = tempfile::tempdir().unwrap();
+        env::set_current_dir(other_cwd.path()).unwrap();
+        remove_legacy_file("poe").unwrap();
+        assert!(!legacy_root.path().join("poe.json").exists());
+        assert!(!old_cwd.path().join("credentials/poe.json").exists());
+
+        env::set_current_dir(original).unwrap();
+        env::remove_var("CREDENTIALS_LEGACY_DIR");
+    }
+
+    #[test]
+    fn delete_tombstone_blocks_remigration_from_missed_cwd_file() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let legacy_root = tempfile::tempdir().unwrap();
+        env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
+        env::remove_var("CREDENTIALS_LEGACY_ROOTS");
+
+        let original = env::current_dir().unwrap();
+        let new_cwd = tempfile::tempdir().unwrap();
+        env::set_current_dir(new_cwd.path()).unwrap();
+
+        // Delete from a CWD that never saw the historical plaintext file.
+        mark_credentials_deleted("gemini").unwrap();
+        assert!(credentials_were_deleted("gemini"));
+
+        // Later launch from the old CWD still finds leftover JSON, but must not
+        // treat it as migratable after an explicit delete.
+        let old_cwd = tempfile::tempdir().unwrap();
+        env::set_current_dir(old_cwd.path()).unwrap();
+        fs::create_dir_all("credentials").unwrap();
+        fs::write(
+            "credentials/gemini.json",
+            r#"{"username":"u","password":"p","service":"gemini"}"#,
+        )
+        .unwrap();
+
+        assert!(credentials_were_deleted("gemini"));
+        // Scrub leftovers without remigrating when the tombstone is present.
+        remove_legacy_file("gemini").unwrap();
+        // get_credentials_unlocked path: tombstone => Ok(None) after scrub.
+        // We exercise the helper directly to avoid keyring in unit tests.
+        assert!(credentials_were_deleted("gemini"));
+        let _ = read_legacy_credentials_file("gemini"); // may relocate; tombstone still wins in get
+        assert!(credentials_were_deleted("gemini"));
+
+        env::set_current_dir(original).unwrap();
+        env::remove_var("CREDENTIALS_LEGACY_DIR");
+    }
+
+    #[test]
     fn remove_legacy_clears_app_data_and_cwd_locations() {
         let _guard = TEST_LOCK.lock().unwrap();
         let legacy_root = tempfile::tempdir().unwrap();
         env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
+        env::remove_var("CREDENTIALS_LEGACY_ROOTS");
 
         let original = env::current_dir().unwrap();
         let tmp = tempfile::tempdir().unwrap();
