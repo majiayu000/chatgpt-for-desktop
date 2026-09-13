@@ -460,9 +460,12 @@ const MIN_PLAUSIBLE_DELETION_MILLIS: u128 = 1_577_836_800_000;
 const TOMBSTONE_SECONDS_CEILING: u128 = 10_000_000_000;
 
 fn quarantine_tombstone_as_now(service: &str) -> Result<SystemTime, String> {
-    let now = SystemTime::now();
-    let _ = mark_credentials_deleted(service);
-    Ok(now)
+    // Persist a stable millisecond cutoff before returning it. Discarding a
+    // write failure would leave the malformed marker in place and make every
+    // later no-entry lookup use a moving `now`, so an intentional older-build
+    // save after an earlier lookup could be scrubbed as pre-deletion.
+    mark_credentials_deleted(service)?;
+    Ok(SystemTime::now())
 }
 
 fn clear_credentials_deleted_marker(service: &str) -> Result<(), String> {
@@ -551,7 +554,17 @@ fn credentials_deleted_at(service: &str) -> Result<Option<SystemTime>, String> {
             Err(_) => return Ok(Some(quarantine_tombstone_as_now(service)?)),
         }
     };
-    Ok(Some(UNIX_EPOCH + duration))
+    // Unchecked `UNIX_EPOCH + duration` panics when the duration exceeds the
+    // platform SystemTime range (notably Windows for u64::MAX-range millis) and
+    // otherwise yields a remote-future cutoff that freezes intentional legacy
+    // saves indefinitely. Bound relative to now and quarantine failures.
+    let Some(deleted_at) = UNIX_EPOCH.checked_add(duration) else {
+        return Ok(Some(quarantine_tombstone_as_now(service)?));
+    };
+    if deleted_at > SystemTime::now() {
+        return Ok(Some(quarantine_tombstone_as_now(service)?));
+    }
+    Ok(Some(deleted_at))
 }
 
 fn credentials_were_deleted(service: &str) -> bool {
@@ -1715,6 +1728,88 @@ mod tests {
         assert!(
             rewritten <= u128::from(u64::MAX),
             "rewritten tombstone must fit in u64 millis"
+        );
+
+        env::remove_var("CREDENTIALS_LEGACY_DIR");
+    }
+
+    #[test]
+    fn credentials_deleted_at_fails_closed_on_u64_max_range_tombstone() {
+        let _guard = test_guard();
+        let legacy_root = tempfile::tempdir().unwrap();
+        env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
+        env::remove_var("CREDENTIALS_LEGACY_ROOTS");
+
+        let dir = legacy_credentials_app_data_dir().unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        let tombstone = deletion_tombstone_path("gemini").unwrap();
+        // Fits in u64 but overflows/far-futures SystemTime via unchecked add.
+        fs::write(&tombstone, u64::MAX.to_string()).unwrap();
+
+        let deleted_at = credentials_deleted_at("gemini")
+            .expect("u64::MAX tombstone must fail closed without panicking");
+        let cutoff = deleted_at.expect("must preserve deletion suppression");
+        assert!(
+            cutoff <= SystemTime::now(),
+            "quarantined cutoff must not be a remote-future freeze"
+        );
+
+        let rewritten: u128 = fs::read_to_string(&tombstone).unwrap().trim().parse().unwrap();
+        assert!(
+            rewritten >= MIN_PLAUSIBLE_DELETION_MILLIS,
+            "quarantine rewrite must be a plausible millisecond timestamp, got {rewritten}"
+        );
+        assert!(
+            rewritten <= u128::from(u64::MAX),
+            "rewritten tombstone must fit in u64 millis"
+        );
+        // Rewritten value must itself be representable and not far-future.
+        let rewritten_time = UNIX_EPOCH
+            .checked_add(Duration::from_millis(rewritten as u64))
+            .expect("rewritten millis must be representable");
+        assert!(
+            rewritten_time <= SystemTime::now(),
+            "rewritten tombstone must not remain a remote-future cutoff"
+        );
+
+        env::remove_var("CREDENTIALS_LEGACY_DIR");
+    }
+
+    #[test]
+    fn quarantine_tombstone_propagates_write_failures() {
+        let _guard = test_guard();
+        let legacy_root = tempfile::tempdir().unwrap();
+        env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
+        env::remove_var("CREDENTIALS_LEGACY_ROOTS");
+
+        let dir = legacy_credentials_app_data_dir().unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        let tombstone = deletion_tombstone_path("gemini").unwrap();
+        fs::write(&tombstone, "not-a-timestamp").unwrap();
+
+        // Make the credentials app-data directory read-only so quarantine rewrite fails.
+        let mut perms = fs::metadata(&dir).unwrap().permissions();
+        let original_readonly = perms.readonly();
+        perms.set_readonly(true);
+        fs::set_permissions(&dir, perms).unwrap();
+
+        let result = credentials_deleted_at("gemini");
+
+        let mut restore = fs::metadata(&dir).unwrap().permissions();
+        restore.set_readonly(original_readonly);
+        fs::set_permissions(&dir, restore).unwrap();
+
+        let err = result.expect_err(
+            "quarantine write failure must propagate, not return a moving now cutoff",
+        );
+        assert!(
+            !err.is_empty(),
+            "expected a non-empty quarantine write error"
+        );
+        // Malformed marker must remain until a stable rewrite succeeds.
+        assert_eq!(
+            fs::read_to_string(&tombstone).unwrap().trim(),
+            "not-a-timestamp"
         );
 
         env::remove_var("CREDENTIALS_LEGACY_DIR");
