@@ -3,8 +3,10 @@ use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// OS keychain service name (matches Tauri app identifier).
 const KEYRING_SERVICE: &str = "com.lif.ai.assistant";
@@ -327,9 +329,15 @@ fn seed_registry_from_bootstrap_locations() -> Result<(), String> {
                         {
                             continue;
                         }
-                        if looks_like_app_legacy_credentials(&path)? {
-                            has_app_legacy = true;
-                            break;
+                        // Defer I/O errors to per-service cleanup: an unreadable
+                        // unrelated `{other}.json` must not abort registry seeding
+                        // (and therefore every save/load/delete) for other services.
+                        match looks_like_app_legacy_credentials(&path) {
+                            Ok(true) => {
+                                has_app_legacy = true;
+                                break;
+                            }
+                            Ok(false) | Err(_) => continue,
                         }
                     }
                 }
@@ -358,21 +366,82 @@ fn deletion_tombstone_path(service: &str) -> Result<PathBuf, String> {
 fn mark_credentials_deleted(service: &str) -> Result<(), String> {
     let dir = legacy_credentials_app_data_dir()?;
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    fs::write(deletion_tombstone_path(service)?, b"1").map_err(|e| e.to_string())
+    // Milliseconds so sub-second file mtimes cannot look "newer" than a
+    // same-second truncated tombstone and escape scrubbing.
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_millis();
+    // Store the deletion instant so a later intentional save from an older build
+    // (which cannot clear this marker) is not scrubbed as a pre-delete leftover.
+    fs::write(deletion_tombstone_path(service)?, millis.to_string()).map_err(|e| e.to_string())
 }
 
 fn clear_credentials_deleted_marker(service: &str) -> Result<(), String> {
     let path = deletion_tombstone_path(service)?;
-    if path.exists() {
-        fs::remove_file(&path).map_err(|e| e.to_string())?;
+    match fs::metadata(&path) {
+        Ok(_) => fs::remove_file(&path).map_err(|e| e.to_string())?,
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "stat deletion tombstone {}: {}",
+                path.display(),
+                e
+            ))
+        }
     }
     Ok(())
 }
 
+fn system_time_as_millis(t: SystemTime) -> u128 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// Instant recorded when credentials were intentionally deleted, if any.
+///
+/// Legacy tombstones that only contained `1` are treated as "suppress all
+/// current leftovers" (cutoff = now) so older installs keep anti-resurrection
+/// behavior until a timed tombstone replaces them. Whole-second timestamps from
+/// earlier timed markers remain supported.
+fn credentials_deleted_at(service: &str) -> Option<SystemTime> {
+    let path = deletion_tombstone_path(service).ok()?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == ErrorKind::NotFound => return None,
+        Err(_) => return None,
+    };
+    let trimmed = raw.trim();
+    if trimmed == "1" {
+        return Some(SystemTime::now());
+    }
+    let value: u128 = trimmed.parse().ok()?;
+    // Heuristic: values that fit in plausible unix-seconds stay seconds;
+    // larger values are milliseconds since epoch.
+    let duration = if value < 10_000_000_000 {
+        Duration::from_secs(value as u64)
+    } else {
+        Duration::from_millis(value as u64)
+    };
+    Some(UNIX_EPOCH + duration)
+}
+
 fn credentials_were_deleted(service: &str) -> bool {
-    deletion_tombstone_path(service)
-        .map(|p| p.exists())
-        .unwrap_or(false)
+    credentials_deleted_at(service).is_some()
+}
+
+/// Distinguish missing paths from metadata failures that `Path::exists()` masks.
+fn legacy_path_present(path: &Path) -> Result<bool, String> {
+    match fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!(
+            "stat legacy credentials {}: {}",
+            path.display(),
+            e
+        )),
+    }
 }
 
 /// Candidate directories that may contain `{service}.json` from older builds.
@@ -450,8 +519,19 @@ fn keyring_entry(service: &str) -> Result<Entry, String> {
 }
 
 fn remove_legacy_file(service: &str) -> Result<(), String> {
+    remove_legacy_files_with_cutoff(service, None)
+}
+
+/// Remove confirmed app legacy files, optionally keeping copies newer than a
+/// deletion tombstone (intentional post-delete saves from an older build).
+fn remove_legacy_files_with_cutoff(
+    service: &str,
+    not_newer_than: Option<SystemTime>,
+) -> Result<(), String> {
     for path in legacy_credentials_paths(service)? {
-        if !path.exists() {
+        // Use metadata so inaccessible parents/stat failures are not masked the
+        // way `Path::exists()` is (it returns false on many I/O errors).
+        if !legacy_path_present(&path)? {
             continue;
         }
         // Only delete files that parse as this app's legacy credentials schema.
@@ -462,6 +542,17 @@ fn remove_legacy_file(service: &str) -> Result<(), String> {
         if !looks_like_app_legacy_credentials(&path)? {
             continue;
         }
+        if let Some(cutoff) = not_newer_than {
+            let mtime = file_mtime(&path).unwrap_or(UNIX_EPOCH);
+            if system_time_as_millis(mtime) > system_time_as_millis(cutoff) {
+                // Newer than the intentional delete — leave for remigration.
+                continue;
+            }
+        }
+        // Record the confirmed source before attempting removal so a failed
+        // delete (permissions / sharing lock) still leaves a retryable root
+        // for future launches from other CWDs.
+        remember_legacy_source(&path)?;
         fs::remove_file(&path).map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -478,7 +569,7 @@ pub fn read_legacy_credentials_file(service: &str) -> Result<Option<Credentials>
     let mut best: Option<(PathBuf, std::time::SystemTime, Credentials)> = None;
 
     for path in legacy_credentials_paths(service)? {
-        if !Path::new(&path).exists() {
+        if !legacy_path_present(&path)? {
             continue;
         }
         let json = fs::read_to_string(&path).map_err(|e| {
@@ -489,7 +580,7 @@ pub fn read_legacy_credentials_file(service: &str) -> Result<Option<Credentials>
             // Skip foreign/malformed JSON; keep searching other roots.
             Err(_) => continue,
         };
-        let mtime = file_mtime(&path).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let mtime = file_mtime(&path).unwrap_or(UNIX_EPOCH);
         match &best {
             Some((_, best_mtime, _)) if mtime <= *best_mtime => {}
             _ => best = Some((path, mtime, credentials)),
@@ -530,10 +621,11 @@ fn get_credentials_unlocked(service: &str) -> Result<Option<Credentials>, String
         }
         Err(keyring::Error::NoEntry) => {
             // A prior delete that could not see every historical CWD must not be
-            // undone by later launching from an old directory that still has JSON.
-            if credentials_were_deleted(service) {
-                remove_legacy_file(service)?;
-                return Ok(None);
+            // undone by later launching from an old directory that still has JSON
+            // from before the delete. Files saved after the tombstone timestamp
+            // (e.g. intentional save in an older build) are allowed to remigrate.
+            if let Some(deleted_at) = credentials_deleted_at(service) {
+                remove_legacy_files_with_cutoff(service, Some(deleted_at))?;
             }
             if let Some(mut legacy) = read_legacy_credentials_file(service)? {
                 // Always migrate and clean up under the requested service key.
@@ -547,6 +639,7 @@ fn get_credentials_unlocked(service: &str) -> Result<Option<Credentials>, String
                 // deletes plaintext. We intentionally do not relocate into
                 // app-data before that write — a failed migrate must leave the
                 // original CWD source as the freshest copy for the next attempt.
+                // An intentional save/migrate also clears the deletion tombstone.
                 save_credentials_unlocked(service, &legacy.username, &legacy.password)?;
                 Ok(Some(legacy))
             } else {
@@ -617,14 +710,20 @@ mod tests {
 
     fn with_temp_cwd<F: FnOnce()>(f: F) {
         let _guard = test_guard();
-        let original = env::current_dir().unwrap();
+        let original = env::current_dir().expect("current_dir before with_temp_cwd");
+        struct RestoreCwd(PathBuf);
+        impl Drop for RestoreCwd {
+            fn drop(&mut self) {
+                let _ = env::set_current_dir(&self.0);
+            }
+        }
+        let _restore = RestoreCwd(original);
         let tmp = tempfile::tempdir().unwrap();
         let legacy_root = tempfile::tempdir().unwrap();
         env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
         env::remove_var("CREDENTIALS_LEGACY_ROOTS");
         env::set_current_dir(tmp.path()).unwrap();
         f();
-        env::set_current_dir(original).unwrap();
         env::remove_var("CREDENTIALS_LEGACY_DIR");
         env::remove_var("CREDENTIALS_LEGACY_ROOTS");
     }
@@ -1153,35 +1252,193 @@ mod tests {
         env::remove_var("CREDENTIALS_LEGACY_ROOTS");
 
         let original = env::current_dir().unwrap();
-        let new_cwd = tempfile::tempdir().unwrap();
-        env::set_current_dir(new_cwd.path()).unwrap();
-
-        // Delete from a CWD that never saw the historical plaintext file.
-        mark_credentials_deleted("gemini").unwrap();
-        assert!(credentials_were_deleted("gemini"));
-
-        // Later launch from the old CWD still finds leftover JSON, but must not
-        // treat it as migratable after an explicit delete.
         let old_cwd = tempfile::tempdir().unwrap();
         env::set_current_dir(old_cwd.path()).unwrap();
         fs::create_dir_all("credentials").unwrap();
+        let leftover = PathBuf::from("credentials/gemini.json");
         fs::write(
-            "credentials/gemini.json",
+            &leftover,
             r#"{"username":"u","password":"p","service":"gemini"}"#,
         )
         .unwrap();
 
+        // Delete after the leftover exists: tombstone timestamp is >= file mtime.
+        mark_credentials_deleted("gemini").unwrap();
         assert!(credentials_were_deleted("gemini"));
-        // Scrub leftovers without remigrating when the tombstone is present.
-        remove_legacy_file("gemini").unwrap();
-        // get_credentials_unlocked path: tombstone => Ok(None) after scrub.
-        // We exercise the helper directly to avoid keyring in unit tests.
+
+        let deleted_at = credentials_deleted_at("gemini").unwrap();
+        remove_legacy_files_with_cutoff("gemini", Some(deleted_at)).unwrap();
+        assert!(
+            !leftover.exists(),
+            "pre-delete leftover must be scrubbed by timed tombstone"
+        );
         assert!(credentials_were_deleted("gemini"));
-        let _ = read_legacy_credentials_file("gemini");
-        assert!(credentials_were_deleted("gemini"));
+        assert!(read_legacy_credentials_file("gemini").unwrap().is_none());
 
         env::set_current_dir(original).unwrap();
         env::remove_var("CREDENTIALS_LEGACY_DIR");
+    }
+
+    #[test]
+    fn delete_tombstone_allows_newer_legacy_save_to_remigrate() {
+        let _guard = test_guard();
+        let legacy_root = tempfile::tempdir().unwrap();
+        env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
+        env::remove_var("CREDENTIALS_LEGACY_ROOTS");
+
+        let original = env::current_dir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        env::set_current_dir(cwd.path()).unwrap();
+
+        // Backdate the tombstone so a subsequent old-build save is clearly newer.
+        let dir = legacy_credentials_app_data_dir().unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        let past_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .saturating_sub(60_000);
+        fs::write(
+            deletion_tombstone_path("gemini").unwrap(),
+            past_millis.to_string(),
+        )
+        .unwrap();
+
+        fs::create_dir_all("credentials").unwrap();
+        fs::write(
+            "credentials/gemini.json",
+            r#"{"username":"fresh","password":"new","service":"gemini"}"#,
+        )
+        .unwrap();
+
+        let deleted_at = credentials_deleted_at("gemini").unwrap();
+        remove_legacy_files_with_cutoff("gemini", Some(deleted_at)).unwrap();
+        let loaded = read_legacy_credentials_file("gemini").unwrap().unwrap();
+        assert_eq!(loaded.username, "fresh");
+        assert_eq!(loaded.password, "new");
+
+        env::set_current_dir(original).unwrap();
+        env::remove_var("CREDENTIALS_LEGACY_DIR");
+    }
+
+    #[test]
+    fn remove_legacy_records_source_before_delete_failure() {
+        with_temp_cwd(|| {
+            fs::create_dir_all("credentials").unwrap();
+            let path = PathBuf::from("credentials/gemini.json");
+            fs::write(
+                &path,
+                r#"{"username":"u","password":"p","service":"gemini"}"#,
+            )
+            .unwrap();
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // File is readable for schema inspect, but not deletable.
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+                let mut dir_perms = fs::metadata("credentials").unwrap().permissions();
+                dir_perms.set_mode(0o555);
+                fs::set_permissions("credentials", dir_perms).unwrap();
+
+                let err = remove_legacy_file("gemini");
+                assert!(err.is_err(), "immutable dir should block delete");
+
+                // Restore permissions for assertions / cleanup.
+                fs::set_permissions("credentials", fs::Permissions::from_mode(0o755)).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+                let roots = load_recorded_legacy_roots().unwrap();
+                let cwd_creds = env::current_dir().unwrap().join("credentials");
+                assert!(
+                    roots.iter().any(|r| paths_equivalent(r, &cwd_creds)),
+                    "failed delete must still record the discovered CWD root; got {roots:?}"
+                );
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = remove_legacy_file("gemini");
+            }
+        });
+    }
+
+    #[test]
+    fn bootstrap_seed_ignores_unreadable_unrelated_json() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let _guard = test_guard();
+            let legacy_root = tempfile::tempdir().unwrap();
+            env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
+            env::remove_var("CREDENTIALS_LEGACY_ROOTS");
+
+            let candidates = bootstrap_legacy_root_candidates();
+            let seed_dir = candidates
+                .first()
+                .expect("bootstrap should include an exe-relative credentials dir");
+            fs::create_dir_all(seed_dir).unwrap();
+            let foreign = seed_dir.join("other.json");
+            let gemini = seed_dir.join("gemini.json");
+            fs::write(&foreign, r#"{"not":"ours"}"#).unwrap();
+            fs::set_permissions(&foreign, fs::Permissions::from_mode(0o000)).unwrap();
+            fs::write(
+                &gemini,
+                r#"{"username":"u","password":"p","service":"gemini"}"#,
+            )
+            .unwrap();
+
+            let result = seed_registry_from_bootstrap_locations();
+
+            let _ = fs::set_permissions(&foreign, fs::Permissions::from_mode(0o644));
+            let _ = fs::remove_file(&foreign);
+            let _ = fs::remove_file(&gemini);
+
+            result.expect("unreadable unrelated JSON must not abort bootstrap seeding");
+            let roots = load_recorded_legacy_roots().unwrap();
+            assert!(
+                roots.iter().any(|r| paths_equivalent(r, seed_dir)),
+                "bootstrap must seed the dir that contains a valid app credential; got {roots:?}"
+            );
+
+            env::remove_var("CREDENTIALS_LEGACY_DIR");
+        }
+    }
+
+    #[test]
+    fn remove_legacy_propagates_parent_metadata_errors() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            with_temp_cwd(|| {
+                fs::create_dir_all("credentials").unwrap();
+                let path = PathBuf::from("credentials/gemini.json");
+                fs::write(
+                    &path,
+                    r#"{"username":"u","password":"p","service":"gemini"}"#,
+                )
+                .unwrap();
+
+                // Remove execute bit so metadata on the child fails (exists() would
+                // mask this as "not present").
+                fs::set_permissions("credentials", fs::Permissions::from_mode(0o000)).unwrap();
+
+                let err = remove_legacy_file("gemini");
+
+                fs::set_permissions("credentials", fs::Permissions::from_mode(0o755)).unwrap();
+
+                assert!(
+                    err.is_err(),
+                    "inaccessible parent must surface a metadata/stat error"
+                );
+                let msg = err.unwrap_err();
+                assert!(
+                    msg.contains("stat legacy credentials"),
+                    "unexpected error: {msg}"
+                );
+            });
+        }
     }
 
     #[test]
