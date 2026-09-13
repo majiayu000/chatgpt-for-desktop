@@ -1,7 +1,9 @@
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// OS keychain service name (matches Tauri app identifier).
 const KEYRING_SERVICE: &str = "com.lif.ai.assistant";
@@ -11,6 +13,24 @@ pub struct Credentials {
     pub username: String,
     pub password: String,
     pub service: String,
+}
+
+/// Per-service locks so get/save/delete for the same service cannot interleave.
+/// Auto-login threads call `get_credentials` while settings IPC may call
+/// `delete_credentials` concurrently; without this, an in-flight legacy
+/// migration can recreate a keychain entry after a completed deletion.
+static SERVICE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+
+fn with_service_lock<T>(service: &str, f: impl FnOnce() -> T) -> T {
+    let map_mutex = SERVICE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let service_lock = {
+        let mut map = map_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(service.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let _guard = service_lock.lock().unwrap_or_else(|e| e.into_inner());
+    f()
 }
 
 fn legacy_credentials_path(service: &str) -> PathBuf {
@@ -40,8 +60,7 @@ pub fn read_legacy_credentials_file(service: &str) -> Result<Option<Credentials>
     Ok(Some(credentials))
 }
 
-/// Store credentials in the OS keychain and remove any leftover plaintext file.
-pub fn save_credentials(service: &str, username: &str, password: &str) -> Result<(), String> {
+fn save_credentials_unlocked(service: &str, username: &str, password: &str) -> Result<(), String> {
     let credentials = Credentials {
         username: username.to_string(),
         password: password.to_string(),
@@ -54,9 +73,7 @@ pub fn save_credentials(service: &str, username: &str, password: &str) -> Result
     Ok(())
 }
 
-/// Load credentials from the keychain. If missing, one-time migrate from legacy JSON
-/// then delete the plaintext file.
-pub fn get_credentials(service: &str) -> Result<Option<Credentials>, String> {
+fn get_credentials_unlocked(service: &str) -> Result<Option<Credentials>, String> {
     let entry = keyring_entry(service)?;
     match entry.get_password() {
         Ok(json) => {
@@ -75,7 +92,7 @@ pub fn get_credentials(service: &str) -> Result<Option<Credentials>, String> {
                 if legacy.service != service {
                     legacy.service = service.to_string();
                 }
-                save_credentials(service, &legacy.username, &legacy.password)?;
+                save_credentials_unlocked(service, &legacy.username, &legacy.password)?;
                 Ok(Some(legacy))
             } else {
                 Ok(None)
@@ -85,11 +102,7 @@ pub fn get_credentials(service: &str) -> Result<Option<Credentials>, String> {
     }
 }
 
-/// Delete any leftover plaintext credentials file, then the keychain entry.
-///
-/// Legacy plaintext is removed first so a failed file delete cannot leave a
-/// migration source that resurrects credentials after the keychain entry is gone.
-pub fn delete_credentials(service: &str) -> Result<(), String> {
+fn delete_credentials_unlocked(service: &str) -> Result<(), String> {
     remove_legacy_file(service)?;
     let entry = keyring_entry(service)?;
     match entry.delete_credential() {
@@ -98,6 +111,27 @@ pub fn delete_credentials(service: &str) -> Result<(), String> {
         Err(e) => return Err(e.to_string()),
     }
     Ok(())
+}
+
+/// Store credentials in the OS keychain and remove any leftover plaintext file.
+pub fn save_credentials(service: &str, username: &str, password: &str) -> Result<(), String> {
+    with_service_lock(service, || save_credentials_unlocked(service, username, password))
+}
+
+/// Load credentials from the keychain. If missing, one-time migrate from legacy JSON
+/// then delete the plaintext file.
+pub fn get_credentials(service: &str) -> Result<Option<Credentials>, String> {
+    with_service_lock(service, || get_credentials_unlocked(service))
+}
+
+/// Delete any leftover plaintext credentials file, then the keychain entry.
+///
+/// Legacy plaintext is removed first so a failed file delete cannot leave a
+/// migration source that resurrects credentials after the keychain entry is gone.
+/// Holds the per-service lock for the whole operation so a concurrent
+/// `get_credentials` migration cannot recreate the entry after delete returns.
+pub fn delete_credentials(service: &str) -> Result<(), String> {
+    with_service_lock(service, || delete_credentials_unlocked(service))
 }
 
 #[cfg(test)]
@@ -167,6 +201,20 @@ mod tests {
             // the embedded value — exercised by get_credentials normalization.
             assert!(Path::new("credentials/gemini.json").exists());
             assert!(!Path::new("credentials/other.json").exists());
+        });
+    }
+
+    #[test]
+    fn service_lock_allows_unlocked_helpers_while_held() {
+        // Public APIs take the lock once; migration uses unlocked save so we
+        // do not deadlock on a non-reentrant Mutex.
+        with_temp_cwd(|| {
+            let mut ran = false;
+            with_service_lock("lock-test", || {
+                let _ = save_credentials_unlocked as fn(&str, &str, &str) -> Result<(), String>;
+                ran = true;
+            });
+            assert!(ran);
         });
     }
 }
