@@ -67,9 +67,15 @@ pub fn get_credentials(service: &str) -> Result<Option<Credentials>, String> {
             Ok(Some(credentials))
         }
         Err(keyring::Error::NoEntry) => {
-            if let Some(legacy) = read_legacy_credentials_file(service)? {
-                // One-time migration into the keychain.
-                save_credentials(&legacy.service, &legacy.username, &legacy.password)?;
+            if let Some(mut legacy) = read_legacy_credentials_file(service)? {
+                // Always migrate and clean up under the requested service key.
+                // If the embedded service differs (copied/renamed file), normalize it
+                // so we do not leave the requested plaintext file behind or overwrite
+                // an unrelated keychain entry.
+                if legacy.service != service {
+                    legacy.service = service.to_string();
+                }
+                save_credentials(service, &legacy.username, &legacy.password)?;
                 Ok(Some(legacy))
             } else {
                 Ok(None)
@@ -79,15 +85,18 @@ pub fn get_credentials(service: &str) -> Result<Option<Credentials>, String> {
     }
 }
 
-/// Delete the keychain entry and any leftover plaintext credentials file.
+/// Delete any leftover plaintext credentials file, then the keychain entry.
+///
+/// Legacy plaintext is removed first so a failed file delete cannot leave a
+/// migration source that resurrects credentials after the keychain entry is gone.
 pub fn delete_credentials(service: &str) -> Result<(), String> {
+    remove_legacy_file(service)?;
     let entry = keyring_entry(service)?;
     match entry.delete_credential() {
         Ok(()) => {}
         Err(keyring::Error::NoEntry) => {}
         Err(e) => return Err(e.to_string()),
     }
-    remove_legacy_file(service)?;
     Ok(())
 }
 
@@ -140,6 +149,24 @@ mod tests {
             assert!(Path::new("credentials/poe.json").exists());
             remove_legacy_file("poe").unwrap();
             assert!(!Path::new("credentials/poe.json").exists());
+        });
+    }
+
+    #[test]
+    fn read_legacy_keeps_requested_path_even_when_embedded_service_differs() {
+        with_temp_cwd(|| {
+            fs::create_dir_all("credentials").unwrap();
+            fs::write(
+                "credentials/gemini.json",
+                r#"{"username":"u","password":"p","service":"other"}"#,
+            )
+            .unwrap();
+            let loaded = read_legacy_credentials_file("gemini").unwrap().unwrap();
+            assert_eq!(loaded.service, "other");
+            // Callers must migrate under the requested path key ("gemini"), not
+            // the embedded value — exercised by get_credentials normalization.
+            assert!(Path::new("credentials/gemini.json").exists());
+            assert!(!Path::new("credentials/other.json").exists());
         });
     }
 }
