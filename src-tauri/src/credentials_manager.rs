@@ -132,14 +132,61 @@ fn with_registry_lock<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, Str
     f()
 }
 
+/// Lossless registry encoding for a filesystem path.
+///
+/// Prefer a UTF-8 string (backward-compatible with older registries). When a
+/// Unix path contains non-UTF-8 bytes, persist the raw OS bytes as a JSON array
+/// so later launches reconstruct the exact path instead of a lossy substitute.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum EncodedPath {
+    Utf8(String),
+    Bytes(Vec<u8>),
+}
+
+fn encode_path_for_registry(path: &Path) -> EncodedPath {
+    match path.to_str() {
+        Some(s) => EncodedPath::Utf8(s.to_string()),
+        None => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                EncodedPath::Bytes(path.as_os_str().as_bytes().to_vec())
+            }
+            #[cfg(not(unix))]
+            {
+                // Windows paths are UTF-16; to_str failing is unexpected. Fall
+                // back to lossy only as a last resort so the registry still writes.
+                EncodedPath::Utf8(path.to_string_lossy().into_owned())
+            }
+        }
+    }
+}
+
+fn decode_path_from_registry(encoded: EncodedPath) -> PathBuf {
+    match encoded {
+        EncodedPath::Utf8(s) => PathBuf::from(s),
+        EncodedPath::Bytes(bytes) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                PathBuf::from(std::ffi::OsStr::from_bytes(&bytes))
+            }
+            #[cfg(not(unix))]
+            {
+                // Byte-array entries are only produced on Unix; treat as UTF-8
+                // lossy if somehow present on other platforms.
+                PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
+            }
+        }
+    }
+}
+
 fn write_legacy_roots_atomic(roots: &[PathBuf]) -> Result<(), String> {
     let path = legacy_roots_registry_path()?;
     let dir = legacy_credentials_app_data_dir()?;
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let encoded: Vec<String> = roots
-        .iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
+    let encoded: Vec<EncodedPath> = roots.iter().map(|p| encode_path_for_registry(p)).collect();
     let tmp = dir.join(format!(
         "legacy-credential-roots.{}.tmp",
         std::process::id()
@@ -166,8 +213,8 @@ fn load_recorded_legacy_roots_unlocked() -> Result<Vec<PathBuf>, String> {
         return Ok(Vec::new());
     }
     let json = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    match serde_json::from_str::<Vec<String>>(&json) {
-        Ok(roots) => Ok(roots.into_iter().map(PathBuf::from).collect()),
+    match serde_json::from_str::<Vec<EncodedPath>>(&json) {
+        Ok(roots) => Ok(roots.into_iter().map(decode_path_from_registry).collect()),
         Err(_) => {
             let quarantine = path.with_extension("json.corrupt");
             let _ = fs::rename(&path, &quarantine);
@@ -240,12 +287,17 @@ fn bootstrap_legacy_root_candidates() -> Vec<PathBuf> {
 ///
 /// Used before deleting or seeding so unrelated `{service}.json` files (for
 /// example under a shared `credentials/` directory used by another tool) are
-/// left alone.
-fn looks_like_app_legacy_credentials(path: &Path) -> bool {
-    let Ok(json) = fs::read_to_string(path) else {
-        return false;
-    };
-    serde_json::from_str::<Credentials>(&json).is_ok()
+/// left alone. I/O failures while inspecting are propagated so callers cannot
+/// treat an unreadable plaintext file as a safe schema mismatch.
+fn looks_like_app_legacy_credentials(path: &Path) -> Result<bool, String> {
+    let json = fs::read_to_string(path).map_err(|e| {
+        format!(
+            "inspect legacy credentials {}: {}",
+            path.display(),
+            e
+        )
+    })?;
+    Ok(serde_json::from_str::<Credentials>(&json).is_ok())
 }
 
 /// Persist bootstrap directories that already contain this app's legacy
@@ -259,17 +311,30 @@ fn seed_registry_from_bootstrap_locations() -> Result<(), String> {
                 continue;
             }
             // Require confirmed app credential JSON, not any `.json` file.
-            let has_app_legacy = fs::read_dir(&candidate)
-                .map(|rd| {
-                    rd.filter_map(|e| e.ok()).any(|e| {
-                        let path = e.path();
-                        path.extension()
+            let mut has_app_legacy = false;
+            match fs::read_dir(&candidate) {
+                Ok(rd) => {
+                    for entry in rd {
+                        let entry = match entry {
+                            Ok(e) => e,
+                            Err(_) => continue,
+                        };
+                        let path = entry.path();
+                        if !path
+                            .extension()
                             .map(|ext| ext == "json")
                             .unwrap_or(false)
-                            && looks_like_app_legacy_credentials(&path)
-                    })
-                })
-                .unwrap_or(false);
+                        {
+                            continue;
+                        }
+                        if looks_like_app_legacy_credentials(&path)? {
+                            has_app_legacy = true;
+                            break;
+                        }
+                    }
+                }
+                Err(_) => continue,
+            }
             if !has_app_legacy {
                 continue;
             }
@@ -392,7 +457,9 @@ fn remove_legacy_file(service: &str) -> Result<(), String> {
         // Only delete files that parse as this app's legacy credentials schema.
         // Unrelated tools may use the same `{service}.json` filename under a
         // shared directory; deleting those would destroy other apps' data.
-        if !looks_like_app_legacy_credentials(&path) {
+        // I/O failures while inspecting are errors — do not silently leave
+        // unreadable plaintext behind after a keychain write.
+        if !looks_like_app_legacy_credentials(&path)? {
             continue;
         }
         fs::remove_file(&path).map_err(|e| e.to_string())?;
@@ -405,6 +472,8 @@ fn remove_legacy_file(service: &str) -> Result<(), String> {
 /// When multiple copies exist, prefer the newest by mtime so a stale app-data
 /// relocation cannot win over a later-updated CWD source. Discovery records the
 /// source root but does not relocate until keychain migration succeeds.
+/// Foreign or malformed JSON at one candidate is skipped so a valid copy in
+/// another root can still be migrated.
 pub fn read_legacy_credentials_file(service: &str) -> Result<Option<Credentials>, String> {
     let mut best: Option<(PathBuf, std::time::SystemTime, Credentials)> = None;
 
@@ -412,8 +481,14 @@ pub fn read_legacy_credentials_file(service: &str) -> Result<Option<Credentials>
         if !Path::new(&path).exists() {
             continue;
         }
-        let json = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        let credentials: Credentials = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        let json = fs::read_to_string(&path).map_err(|e| {
+            format!("read legacy credentials {}: {}", path.display(), e)
+        })?;
+        let credentials: Credentials = match serde_json::from_str(&json) {
+            Ok(c) => c,
+            // Skip foreign/malformed JSON; keep searching other roots.
+            Err(_) => continue,
+        };
         let mtime = file_mtime(&path).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         match &best {
             Some((_, best_mtime, _)) if mtime <= *best_mtime => {}
@@ -927,6 +1002,147 @@ mod tests {
             remove_legacy_file("gemini").unwrap();
             assert!(!foreign.exists());
         });
+    }
+
+    #[test]
+    fn read_legacy_skips_foreign_json_and_continues_search() {
+        let _guard = test_guard();
+        let legacy_root = tempfile::tempdir().unwrap();
+        env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
+        env::remove_var("CREDENTIALS_LEGACY_ROOTS");
+
+        let sample = Credentials {
+            username: "user@example.com".into(),
+            password: "s3cret".into(),
+            service: "gemini".into(),
+        };
+        fs::write(
+            legacy_root.path().join("gemini.json"),
+            serde_json::to_string(&sample).unwrap(),
+        )
+        .unwrap();
+
+        let original = env::current_dir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        env::set_current_dir(cwd.path()).unwrap();
+        fs::create_dir_all("credentials").unwrap();
+        // Foreign/malformed CWD file must not abort search of app-data copy.
+        fs::write(
+            "credentials/gemini.json",
+            r#"{"api_key":"sk-foreign","project":"other-app"}"#,
+        )
+        .unwrap();
+
+        let loaded = read_legacy_credentials_file("gemini").unwrap().unwrap();
+        assert_eq!(loaded, sample);
+
+        env::set_current_dir(original).unwrap();
+        env::remove_var("CREDENTIALS_LEGACY_DIR");
+    }
+
+    #[test]
+    fn remove_legacy_propagates_unreadable_file_inspection_errors() {
+        with_temp_cwd(|| {
+            fs::create_dir_all("credentials").unwrap();
+            let path = PathBuf::from("credentials/gemini.json");
+            fs::write(
+                &path,
+                r#"{"username":"u","password":"p","service":"gemini"}"#,
+            )
+            .unwrap();
+
+            // Make the file unreadable so inspection cannot confirm schema.
+            let mut perms = fs::metadata(&path).unwrap().permissions();
+            perms.set_readonly(true);
+            // On Unix, clear owner read bit to force a permission error.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+            }
+            #[cfg(not(unix))]
+            {
+                fs::set_permissions(&path, perms).unwrap();
+            }
+
+            let err = remove_legacy_file("gemini");
+
+            // Restore so tempfile cleanup can remove the file.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o644));
+            }
+            #[cfg(not(unix))]
+            {
+                let mut perms = fs::metadata(&path).unwrap().permissions();
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(&path, perms);
+            }
+
+            #[cfg(unix)]
+            {
+                assert!(
+                    err.is_err(),
+                    "unreadable legacy file must surface an inspection error"
+                );
+                let msg = err.unwrap_err();
+                assert!(
+                    msg.contains("inspect legacy credentials"),
+                    "unexpected error: {msg}"
+                );
+            }
+            #[cfg(not(unix))]
+            {
+                // Windows permission models vary; at least ensure no panic.
+                let _ = err;
+            }
+        });
+    }
+
+    #[test]
+    fn registry_roundtrips_non_utf8_unix_paths() {
+        #[cfg(unix)]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+
+            let _guard = test_guard();
+            let legacy_root = tempfile::tempdir().unwrap();
+            env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
+            env::remove_var("CREDENTIALS_LEGACY_ROOTS");
+
+            // APFS rejects non-UTF-8 directory names on create, but historical
+            // launch paths on other Unix filesystems may still contain them —
+            // exercise lossless registry encode/decode without mkdir.
+            let weird = PathBuf::from(OsStr::from_bytes(b"/tmp/cred\xffentials"));
+
+            write_legacy_roots_atomic(&[weird.clone()]).unwrap();
+            let loaded = load_recorded_legacy_roots().unwrap();
+            assert!(
+                loaded.iter().any(|r| r == &weird),
+                "lossy UTF-8 substitution must not rewrite non-UTF-8 roots; got {loaded:?}"
+            );
+
+            // Ensure on-disk encoding used a byte array, not to_string_lossy.
+            let registry = legacy_root.path().join("legacy-credential-roots.json");
+            let raw = fs::read_to_string(&registry).unwrap();
+            assert!(
+                raw.starts_with("[[") || raw.contains("],["),
+                "non-UTF-8 path should serialize as a byte array: {raw}"
+            );
+            // 0xFF must appear as 255 in the JSON byte array (not U+FFFD).
+            assert!(
+                raw.contains("255"),
+                "0xFF byte must be preserved in registry JSON: {raw}"
+            );
+            assert!(
+                !raw.contains('\u{FFFD}'),
+                "registry must not contain U+FFFD from to_string_lossy: {raw}"
+            );
+
+            env::remove_var("CREDENTIALS_LEGACY_DIR");
+        }
     }
 
     #[test]
