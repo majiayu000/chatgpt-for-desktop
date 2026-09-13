@@ -18,6 +18,43 @@ pub struct Credentials {
     pub service: String,
 }
 
+/// JSON payload stored in the OS keychain. Extends the public `Credentials`
+/// shape with an optional write timestamp so a later plaintext save from an
+/// older build can be detected as newer than the keychain copy.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+struct KeychainPayload {
+    username: String,
+    password: String,
+    service: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    updated_at_ms: Option<u128>,
+}
+
+impl KeychainPayload {
+    fn from_credentials(username: &str, password: &str, service: &str) -> Self {
+        Self {
+            username: username.to_string(),
+            password: password.to_string(),
+            service: service.to_string(),
+            updated_at_ms: Some(system_time_as_millis(SystemTime::now())),
+        }
+    }
+
+    fn into_credentials(self) -> Credentials {
+        Credentials {
+            username: self.username,
+            password: self.password,
+            service: self.service,
+        }
+    }
+
+    fn same_secret_as(&self, other: &Credentials) -> bool {
+        self.username == other.username
+            && self.password == other.password
+            && self.service == other.service
+    }
+}
+
 /// Per-service locks so get/save/delete for the same service cannot interleave.
 /// Auto-login threads call `get_credentials` while settings IPC may call
 /// `delete_credentials` concurrently; without this, an in-flight legacy
@@ -405,18 +442,31 @@ fn system_time_as_millis(t: SystemTime) -> u128 {
 /// current leftovers" (cutoff = now) so older installs keep anti-resurrection
 /// behavior until a timed tombstone replaces them. Whole-second timestamps from
 /// earlier timed markers remain supported.
-fn credentials_deleted_at(service: &str) -> Option<SystemTime> {
-    let path = deletion_tombstone_path(service).ok()?;
+///
+/// `NotFound` means no deletion occurred. Other tombstone read/stat I/O errors
+/// propagate so a locked or unreadable marker cannot be mistaken for "absent"
+/// and allow a stale legacy file to remigrate.
+fn credentials_deleted_at(service: &str) -> Result<Option<SystemTime>, String> {
+    let path = deletion_tombstone_path(service)?;
     let raw = match fs::read_to_string(&path) {
         Ok(s) => s,
-        Err(e) if e.kind() == ErrorKind::NotFound => return None,
-        Err(_) => return None,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(format!(
+                "read deletion tombstone {}: {}",
+                path.display(),
+                e
+            ))
+        }
     };
     let trimmed = raw.trim();
     if trimmed == "1" {
-        return Some(SystemTime::now());
+        return Ok(Some(SystemTime::now()));
     }
-    let value: u128 = trimmed.parse().ok()?;
+    let value: u128 = match trimmed.parse() {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
     // Heuristic: values that fit in plausible unix-seconds stay seconds;
     // larger values are milliseconds since epoch.
     let duration = if value < 10_000_000_000 {
@@ -424,11 +474,31 @@ fn credentials_deleted_at(service: &str) -> Option<SystemTime> {
     } else {
         Duration::from_millis(value as u64)
     };
-    Some(UNIX_EPOCH + duration)
+    Ok(Some(UNIX_EPOCH + duration))
 }
 
 fn credentials_were_deleted(service: &str) -> bool {
-    credentials_deleted_at(service).is_some()
+    matches!(credentials_deleted_at(service), Ok(Some(_)))
+}
+
+/// Whether a differing legacy plaintext file should replace the keychain copy.
+///
+/// Prefer legacy when its mtime is strictly newer than the keychain write stamp.
+/// When the keychain entry has no stamp (pre-timestamp installs), treat a
+/// differing legacy file as an intentional older-build save and reconcile it;
+/// same-secret leftovers are never reconciled (cleanup-only).
+fn should_reconcile_legacy_over_keychain(
+    keychain: &KeychainPayload,
+    legacy: &Credentials,
+    legacy_mtime: SystemTime,
+) -> bool {
+    if keychain.same_secret_as(legacy) {
+        return false;
+    }
+    match keychain.updated_at_ms {
+        Some(written_ms) => system_time_as_millis(legacy_mtime) > written_ms,
+        None => true,
+    }
 }
 
 /// Distinguish missing paths from metadata failures that `Path::exists()` masks.
@@ -565,8 +635,10 @@ fn remove_legacy_files_with_cutoff(
 /// source root but does not relocate until keychain migration succeeds.
 /// Foreign or malformed JSON at one candidate is skipped so a valid copy in
 /// another root can still be migrated.
-pub fn read_legacy_credentials_file(service: &str) -> Result<Option<Credentials>, String> {
-    let mut best: Option<(PathBuf, std::time::SystemTime, Credentials)> = None;
+fn read_freshest_legacy_credentials(
+    service: &str,
+) -> Result<Option<(Credentials, SystemTime)>, String> {
+    let mut best: Option<(PathBuf, SystemTime, Credentials)> = None;
 
     for path in legacy_credentials_paths(service)? {
         if !legacy_path_present(&path)? {
@@ -587,20 +659,20 @@ pub fn read_legacy_credentials_file(service: &str) -> Result<Option<Credentials>
         }
     }
 
-    if let Some((path, _, credentials)) = best {
+    if let Some((path, mtime, credentials)) = best {
         remember_legacy_source(&path)?;
-        return Ok(Some(credentials));
+        return Ok(Some((credentials, mtime)));
     }
     Ok(None)
 }
 
+pub fn read_legacy_credentials_file(service: &str) -> Result<Option<Credentials>, String> {
+    Ok(read_freshest_legacy_credentials(service)?.map(|(c, _)| c))
+}
+
 fn save_credentials_unlocked(service: &str, username: &str, password: &str) -> Result<(), String> {
-    let credentials = Credentials {
-        username: username.to_string(),
-        password: password.to_string(),
-        service: service.to_string(),
-    };
-    let json = serde_json::to_string(&credentials).map_err(|e| e.to_string())?;
+    let payload = KeychainPayload::from_credentials(username, password, service);
+    let json = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
     let entry = keyring_entry(service)?;
     entry.set_password(&json).map_err(|e| e.to_string())?;
     // Intentional save after delete clears the anti-resurrection tombstone.
@@ -613,21 +685,34 @@ fn get_credentials_unlocked(service: &str) -> Result<Option<Credentials>, String
     let entry = keyring_entry(service)?;
     match entry.get_password() {
         Ok(json) => {
-            let credentials: Credentials = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+            let payload: KeychainPayload =
+                serde_json::from_str(&json).map_err(|e| e.to_string())?;
+            // If a newer legacy plaintext exists (e.g. user saved via an older
+            // build after the keychain entry was created), promote it before
+            // cleanup so the intentional update is not discarded.
+            if let Some((mut legacy, legacy_mtime)) = read_freshest_legacy_credentials(service)? {
+                if legacy.service != service {
+                    legacy.service = service.to_string();
+                }
+                if should_reconcile_legacy_over_keychain(&payload, &legacy, legacy_mtime) {
+                    save_credentials_unlocked(service, &legacy.username, &legacy.password)?;
+                    return Ok(Some(legacy));
+                }
+            }
             // Surface leftover-plaintext cleanup failures so migration cannot leave
             // credentials/{service}.json on disk indefinitely after a keychain hit.
             remove_legacy_file(service)?;
-            Ok(Some(credentials))
+            Ok(Some(payload.into_credentials()))
         }
         Err(keyring::Error::NoEntry) => {
             // A prior delete that could not see every historical CWD must not be
             // undone by later launching from an old directory that still has JSON
             // from before the delete. Files saved after the tombstone timestamp
             // (e.g. intentional save in an older build) are allowed to remigrate.
-            if let Some(deleted_at) = credentials_deleted_at(service) {
+            if let Some(deleted_at) = credentials_deleted_at(service)? {
                 remove_legacy_files_with_cutoff(service, Some(deleted_at))?;
             }
-            if let Some(mut legacy) = read_legacy_credentials_file(service)? {
+            if let Some((mut legacy, _)) = read_freshest_legacy_credentials(service)? {
                 // Always migrate and clean up under the requested service key.
                 // If the embedded service differs (copied/renamed file), normalize it
                 // so we do not leave the requested plaintext file behind or overwrite
@@ -1266,7 +1351,7 @@ mod tests {
         mark_credentials_deleted("gemini").unwrap();
         assert!(credentials_were_deleted("gemini"));
 
-        let deleted_at = credentials_deleted_at("gemini").unwrap();
+        let deleted_at = credentials_deleted_at("gemini").unwrap().unwrap();
         remove_legacy_files_with_cutoff("gemini", Some(deleted_at)).unwrap();
         assert!(
             !leftover.exists(),
@@ -1311,7 +1396,7 @@ mod tests {
         )
         .unwrap();
 
-        let deleted_at = credentials_deleted_at("gemini").unwrap();
+        let deleted_at = credentials_deleted_at("gemini").unwrap().unwrap();
         remove_legacy_files_with_cutoff("gemini", Some(deleted_at)).unwrap();
         let loaded = read_legacy_credentials_file("gemini").unwrap().unwrap();
         assert_eq!(loaded.username, "fresh");
@@ -1319,6 +1404,86 @@ mod tests {
 
         env::set_current_dir(original).unwrap();
         env::remove_var("CREDENTIALS_LEGACY_DIR");
+    }
+
+    #[test]
+    fn credentials_deleted_at_propagates_tombstone_read_errors() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let _guard = test_guard();
+            let legacy_root = tempfile::tempdir().unwrap();
+            env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
+            env::remove_var("CREDENTIALS_LEGACY_ROOTS");
+
+            let dir = legacy_credentials_app_data_dir().unwrap();
+            fs::create_dir_all(&dir).unwrap();
+            let tombstone = deletion_tombstone_path("gemini").unwrap();
+            fs::write(&tombstone, "1234567890123").unwrap();
+            fs::set_permissions(&tombstone, fs::Permissions::from_mode(0o000)).unwrap();
+
+            let err = credentials_deleted_at("gemini");
+
+            let _ = fs::set_permissions(&tombstone, fs::Permissions::from_mode(0o644));
+            env::remove_var("CREDENTIALS_LEGACY_DIR");
+
+            assert!(
+                err.is_err(),
+                "unreadable tombstone must not be treated as absent"
+            );
+            let msg = err.unwrap_err();
+            assert!(
+                msg.contains("read deletion tombstone"),
+                "unexpected error: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn reconcile_prefers_newer_legacy_over_stamped_keychain() {
+        let keychain = KeychainPayload {
+            username: "old".into(),
+            password: "oldpass".into(),
+            service: "gemini".into(),
+            updated_at_ms: Some(1_000),
+        };
+        let legacy = Credentials {
+            username: "new".into(),
+            password: "newpass".into(),
+            service: "gemini".into(),
+        };
+        let newer = UNIX_EPOCH + Duration::from_millis(2_000);
+        let older = UNIX_EPOCH + Duration::from_millis(500);
+
+        assert!(should_reconcile_legacy_over_keychain(
+            &keychain, &legacy, newer
+        ));
+        assert!(!should_reconcile_legacy_over_keychain(
+            &keychain, &legacy, older
+        ));
+
+        // Same secret leftovers are cleanup-only even when mtime is newer.
+        let same = Credentials {
+            username: "old".into(),
+            password: "oldpass".into(),
+            service: "gemini".into(),
+        };
+        assert!(!should_reconcile_legacy_over_keychain(
+            &keychain, &same, newer
+        ));
+
+        // Pre-timestamp keychain entries reconcile any differing legacy save.
+        let unstamped = KeychainPayload {
+            updated_at_ms: None,
+            ..keychain
+        };
+        assert!(should_reconcile_legacy_over_keychain(
+            &unstamped, &legacy, older
+        ));
+        assert!(!should_reconcile_legacy_over_keychain(
+            &unstamped, &same, newer
+        ));
     }
 
     #[test]
