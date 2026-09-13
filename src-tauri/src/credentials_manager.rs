@@ -505,10 +505,11 @@ fn system_time_as_millis(t: SystemTime) -> u128 {
 
 /// Instant recorded when credentials were intentionally deleted, if any.
 ///
-/// Legacy tombstones that only contained `1` are treated as "suppress all
-/// current leftovers" (cutoff = now) so older installs keep anti-resurrection
-/// behavior until a timed tombstone replaces them. Whole-second timestamps from
-/// earlier timed markers remain supported.
+/// Legacy tombstones that only contained `1` keep anti-resurrection behavior by
+/// rewriting a single stable millisecond cutoff on first read. Returning a
+/// fresh `now` without replacing the marker would make every later lookup use a
+/// moving cutoff and scrub intentional post-delete saves from older builds.
+/// Whole-second timestamps from earlier timed markers remain supported.
 ///
 /// `NotFound` means no deletion occurred. Other tombstone read/stat I/O errors
 /// propagate so a locked or unreadable marker cannot be mistaken for "absent"
@@ -534,7 +535,8 @@ fn credentials_deleted_at(service: &str) -> Result<Option<SystemTime>, String> {
     };
     let trimmed = raw.trim();
     if trimmed == "1" {
-        return Ok(Some(SystemTime::now()));
+        // Convert the untimed legacy marker to one fixed cutoff before cleanup.
+        return Ok(Some(quarantine_tombstone_as_now(service)?));
     }
     let value: u128 = match trimmed.parse() {
         Ok(v) => v,
@@ -1694,6 +1696,77 @@ mod tests {
         assert_eq!(loaded.password, "new");
 
         env::set_current_dir(original).unwrap();
+        env::remove_var("CREDENTIALS_LEGACY_DIR");
+    }
+
+    #[test]
+    fn credentials_deleted_at_rewrites_legacy_one_tombstone_to_fixed_cutoff() {
+        let _guard = test_guard();
+        let legacy_root = tempfile::tempdir().unwrap();
+        env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
+        env::remove_var("CREDENTIALS_LEGACY_ROOTS");
+
+        let dir = legacy_credentials_app_data_dir().unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        let tombstone = deletion_tombstone_path("gemini").unwrap();
+        fs::write(&tombstone, "1").unwrap();
+
+        let _first = credentials_deleted_at("gemini")
+            .expect("legacy 1 tombstone must convert")
+            .expect("must preserve deletion suppression");
+        let rewritten = fs::read_to_string(&tombstone).unwrap();
+        let rewritten_millis: u128 = rewritten
+            .trim()
+            .parse()
+            .expect("legacy 1 must be rewritten to a numeric timestamp");
+        assert!(
+            rewritten_millis >= MIN_PLAUSIBLE_DELETION_MILLIS,
+            "rewritten cutoff must be a plausible millisecond timestamp, got {rewritten_millis}"
+        );
+        assert_ne!(
+            rewritten.trim(),
+            "1",
+            "legacy untimed marker must be replaced on first read"
+        );
+
+        // Sleep so a moving SystemTime::now() would diverge across lookups.
+        std::thread::sleep(Duration::from_millis(20));
+        let second = credentials_deleted_at("gemini")
+            .expect("rewritten tombstone must remain readable")
+            .expect("must keep deletion suppression");
+        let third = credentials_deleted_at("gemini")
+            .expect("stable tombstone must remain readable")
+            .expect("must keep deletion suppression");
+        assert_eq!(
+            system_time_as_millis(second),
+            system_time_as_millis(third),
+            "legacy 1 conversion must leave a fixed cutoff, not a moving now"
+        );
+        assert_eq!(
+            system_time_as_millis(second),
+            rewritten_millis,
+            "subsequent lookups must use the rewritten timestamp"
+        );
+        assert_eq!(
+            fs::read_to_string(&tombstone).unwrap().trim(),
+            rewritten.trim(),
+            "subsequent lookups must not keep rewriting the converted marker"
+        );
+
+        // Intentional older-build save after conversion must survive scrubbing
+        // against the fixed cutoff (a moving now would scrub it).
+        let legacy_path = dir.join("gemini.json");
+        fs::write(
+            &legacy_path,
+            r#"{"username":"fresh","password":"post-delete-save","service":"gemini"}"#,
+        )
+        .unwrap();
+        remove_legacy_files_with_cutoff("gemini", Some(second)).unwrap();
+        assert!(
+            legacy_path.exists(),
+            "post-conversion newer legacy save must not be scrubbed by a moving cutoff"
+        );
+
         env::remove_var("CREDENTIALS_LEGACY_DIR");
     }
 
