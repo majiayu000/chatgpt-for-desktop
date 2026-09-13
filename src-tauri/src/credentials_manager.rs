@@ -11,6 +11,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// OS keychain service name (matches Tauri app identifier).
 const KEYRING_SERVICE: &str = "com.lif.ai.assistant";
 
+/// Credential service keys accepted via IPC / filesystem path construction.
+/// Restricting to this allowlist prevents `PathBuf::join` escapes when a caller
+/// supplies absolute or `../`-style service strings.
+const SUPPORTED_SERVICES: &[&str] = &["gemini", "poe"];
+
+/// Reject unsupported or path-like service names before any filesystem join.
+fn validate_service_name(service: &str) -> Result<(), String> {
+    if SUPPORTED_SERVICES.contains(&service) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unsupported credentials service `{service}` (expected gemini or poe)"
+        ))
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Credentials {
     pub username: String,
@@ -409,10 +425,12 @@ fn seed_registry_from_bootstrap_locations() -> Result<(), String> {
 }
 
 fn deletion_tombstone_path(service: &str) -> Result<PathBuf, String> {
+    validate_service_name(service)?;
     Ok(legacy_credentials_app_data_dir()?.join(format!("{}.deleted", service)))
 }
 
 fn mark_credentials_deleted(service: &str) -> Result<(), String> {
+    validate_service_name(service)?;
     let dir = legacy_credentials_app_data_dir()?;
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     // Milliseconds so sub-second file mtimes cannot look "newer" than a
@@ -518,11 +536,20 @@ fn credentials_deleted_at(service: &str) -> Result<Option<SystemTime>, String> {
         if value < u128::from(MIN_PLAUSIBLE_DELETION_SECS) {
             return Ok(Some(quarantine_tombstone_as_now(service)?));
         }
-        Duration::from_secs(value as u64)
+        // value < 10^10 fits in u64; use try_from for consistency.
+        let secs = u64::try_from(value).map_err(|_| {
+            format!("deletion tombstone seconds overflow for `{service}`")
+        })?;
+        Duration::from_secs(secs)
     } else if value < MIN_PLAUSIBLE_DELETION_MILLIS {
         return Ok(Some(quarantine_tombstone_as_now(service)?));
     } else {
-        Duration::from_millis(value as u64)
+        // Oversized numerics (e.g. u64::MAX+1) must not wrap via `as u64` into a
+        // 1970-era cutoff that remigrates deleted credentials.
+        match u64::try_from(value) {
+            Ok(millis) => Duration::from_millis(millis),
+            Err(_) => return Ok(Some(quarantine_tombstone_as_now(service)?)),
+        }
     };
     Ok(Some(UNIX_EPOCH + duration))
 }
@@ -614,6 +641,7 @@ fn legacy_credential_roots() -> Result<Vec<PathBuf>, String> {
 
 /// Every supported legacy plaintext path for a service.
 fn legacy_credentials_paths(service: &str) -> Result<Vec<PathBuf>, String> {
+    validate_service_name(service)?;
     let file_name = format!("{}.json", service);
     Ok(legacy_credential_roots()?
         .into_iter()
@@ -932,12 +960,14 @@ fn delete_credentials_unlocked(service: &str) -> Result<(), String> {
 
 /// Store credentials in the OS keychain and remove any leftover plaintext file.
 pub fn save_credentials(service: &str, username: &str, password: &str) -> Result<(), String> {
+    validate_service_name(service)?;
     with_service_lock(service, || save_credentials_unlocked(service, username, password))
 }
 
 /// Load credentials from the keychain. If missing, one-time migrate from legacy JSON
 /// then delete the plaintext file.
 pub fn get_credentials(service: &str) -> Result<Option<Credentials>, String> {
+    validate_service_name(service)?;
     with_service_lock(service, || get_credentials_unlocked(service))
 }
 
@@ -948,6 +978,7 @@ pub fn get_credentials(service: &str) -> Result<Option<Credentials>, String> {
 /// Holds the per-service lock for the whole operation so a concurrent
 /// `get_credentials` migration cannot recreate the entry after delete returns.
 pub fn delete_credentials(service: &str) -> Result<(), String> {
+    validate_service_name(service)?;
     with_service_lock(service, || delete_credentials_unlocked(service))
 }
 
@@ -1646,6 +1677,91 @@ mod tests {
         assert!(
             rewritten >= MIN_PLAUSIBLE_DELETION_MILLIS,
             "quarantine rewrite must be a plausible millisecond timestamp, got {rewritten}"
+        );
+
+        env::remove_var("CREDENTIALS_LEGACY_DIR");
+    }
+
+    #[test]
+    fn credentials_deleted_at_fails_closed_on_u64_overflow_tombstone() {
+        let _guard = test_guard();
+        let legacy_root = tempfile::tempdir().unwrap();
+        env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
+        env::remove_var("CREDENTIALS_LEGACY_ROOTS");
+
+        let dir = legacy_credentials_app_data_dir().unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        let tombstone = deletion_tombstone_path("gemini").unwrap();
+        // u64::MAX + 1 parses as u128 but wraps to 0 under `as u64`.
+        fs::write(&tombstone, "18446744073709551616").unwrap();
+
+        let deleted_at = credentials_deleted_at("gemini")
+            .expect("overflow tombstone must fail closed, not wrap to epoch");
+        let cutoff = deleted_at.expect("must preserve deletion suppression");
+        let cutoff_secs = cutoff
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            cutoff_secs >= MIN_PLAUSIBLE_DELETION_SECS,
+            "overflow wrap must not yield a 1970-era cutoff, got {cutoff_secs}"
+        );
+
+        let rewritten: u128 = fs::read_to_string(&tombstone).unwrap().trim().parse().unwrap();
+        assert!(
+            rewritten >= MIN_PLAUSIBLE_DELETION_MILLIS,
+            "quarantine rewrite must be a plausible millisecond timestamp, got {rewritten}"
+        );
+        assert!(
+            rewritten <= u128::from(u64::MAX),
+            "rewritten tombstone must fit in u64 millis"
+        );
+
+        env::remove_var("CREDENTIALS_LEGACY_DIR");
+    }
+
+    #[test]
+    fn path_helpers_reject_path_like_service_names() {
+        let _guard = test_guard();
+        let legacy_root = tempfile::tempdir().unwrap();
+        env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
+        env::remove_var("CREDENTIALS_LEGACY_ROOTS");
+
+        for evil in [
+            "/tmp/item",
+            "../escape",
+            "gemini/../poe",
+            "foo\\bar",
+            "unknown",
+        ] {
+            let tombstone_err = deletion_tombstone_path(evil).expect_err("must reject");
+            assert!(
+                tombstone_err.contains("unsupported credentials service"),
+                "unexpected tombstone error for {evil:?}: {tombstone_err}"
+            );
+            let legacy_err = legacy_credentials_paths(evil).expect_err("must reject");
+            assert!(
+                legacy_err.contains("unsupported credentials service"),
+                "unexpected legacy path error for {evil:?}: {legacy_err}"
+            );
+            let delete_err = delete_credentials(evil).expect_err("public delete must reject");
+            assert!(
+                delete_err.contains("unsupported credentials service"),
+                "unexpected delete error for {evil:?}: {delete_err}"
+            );
+            // Absolute services must never create files outside app-data.
+            assert!(
+                !Path::new("/tmp/item.deleted").exists(),
+                "must not write escaped tombstone for {evil:?}"
+            );
+        }
+
+        // Supported names still resolve under the configured app-data dir.
+        let ok = deletion_tombstone_path("gemini").unwrap();
+        assert!(
+            ok.starts_with(legacy_root.path()),
+            "supported tombstone must stay under app-data, got {}",
+            ok.display()
         );
 
         env::remove_var("CREDENTIALS_LEGACY_DIR");
