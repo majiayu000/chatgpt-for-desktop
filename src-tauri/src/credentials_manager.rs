@@ -1,3 +1,4 @@
+use fslock::LockFile;
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -19,9 +20,29 @@ pub struct Credentials {
 /// Auto-login threads call `get_credentials` while settings IPC may call
 /// `delete_credentials` concurrently; without this, an in-flight legacy
 /// migration can recreate a keychain entry after a completed deletion.
+///
+/// Combines a process-local mutex with an inter-process file lock so two
+/// app instances sharing the same working directory cannot race migrate/delete.
 static SERVICE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 
-fn with_service_lock<T>(service: &str, f: impl FnOnce() -> T) -> T {
+fn service_lock_path(service: &str) -> PathBuf {
+    // Keep lock names flat even if a service string contains path separators.
+    let safe: String = service
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    PathBuf::from("credentials")
+        .join(".locks")
+        .join(format!("{}.lock", safe))
+}
+
+fn with_service_lock<T>(service: &str, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     let map_mutex = SERVICE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let service_lock = {
         let mut map = map_mutex.lock().unwrap_or_else(|e| e.into_inner());
@@ -30,6 +51,17 @@ fn with_service_lock<T>(service: &str, f: impl FnOnce() -> T) -> T {
             .clone()
     };
     let _guard = service_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    let lock_path = service_lock_path(service);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create lock dir: {}", e))?;
+    }
+    let mut file_lock =
+        LockFile::open(&lock_path).map_err(|e| format!("open service lock: {}", e))?;
+    file_lock
+        .lock()
+        .map_err(|e| format!("acquire service lock: {}", e))?;
+
     f()
 }
 
@@ -213,8 +245,11 @@ mod tests {
             with_service_lock("lock-test", || {
                 let _ = save_credentials_unlocked as fn(&str, &str, &str) -> Result<(), String>;
                 ran = true;
-            });
+                Ok(())
+            })
+            .unwrap();
             assert!(ran);
+            assert!(Path::new("credentials/.locks/lock-test.lock").exists());
         });
     }
 }

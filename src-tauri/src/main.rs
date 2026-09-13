@@ -135,20 +135,14 @@ fn load_browser_emulation_script() -> Result<String, String> {
 // 定义命令：自动登录
 #[tauri::command]
 fn auto_login(window: tauri::WebviewWindow, service: String) -> Result<bool, String> {
-    // 获取凭证（keychain / migrated legacy file）
-    if let Ok(Some(creds)) = credentials_manager::get_credentials(&service) {
-        // 生成登录脚本
-        let script = generate_login_script(&service, &creds.username, &creds.password);
-
-        // 执行登录脚本
-        if let Err(e) = window.eval(&script) {
-            return Err(e.to_string());
+    // Propagate keychain/migration failures instead of treating them as "no credentials".
+    match credentials_manager::get_credentials(&service)? {
+        Some(creds) => {
+            let script = generate_login_script(&service, &creds.username, &creds.password);
+            window.eval(&script).map_err(|e| e.to_string())?;
+            Ok(true)
         }
-
-        Ok(true)
-    } else {
-        // 没有保存的凭证
-        Ok(false)
+        None => Ok(false),
     }
 }
 
@@ -219,8 +213,10 @@ fn main() {
                   // 注入浏览器模拟脚本
                   let _ = inject_browser_emulation(window_clone2.clone());
 
-                  // 尝试自动登录
-                  let _ = auto_login(window_clone2, "gemini".to_string());
+                  // 尝试自动登录；surface keychain errors to stderr for diagnostics
+                  if let Err(e) = auto_login(window_clone2, "gemini".to_string()) {
+                    eprintln!("auto_login(gemini) failed: {}", e);
+                  }
                 });
               }
             },
@@ -313,8 +309,10 @@ fn main() {
                             // 注入浏览器模拟脚本
                             let _ = inject_browser_emulation(window_clone2.clone());
 
-                            // 尝试自动登录
-                            let _ = auto_login(window_clone2, "poe".to_string());
+                            // 尝试自动登录；surface keychain errors to stderr for diagnostics
+                            if let Err(e) = auto_login(window_clone2, "poe".to_string()) {
+                              eprintln!("auto_login(poe) failed: {}", e);
+                            }
                           });
                         }
                       },
