@@ -288,14 +288,15 @@ fn record_legacy_root(root: &Path) -> Result<(), String> {
 /// Historical launch locations that do not depend on a prior discovery write.
 ///
 /// Old builds wrote relative to the process CWD. Typical CWDs for this desktop
-/// app include the executable directory (and a few parents for macOS `.app`
-/// bundles / nested launchers). These are seeded into the candidate list
+/// app include the executable directory and, on macOS, the `.app` bundle layout
+/// (`Foo.app/Contents/MacOS`). These are seeded into the candidate list
 /// independently of the on-disk registry so a first upgraded launch from a
 /// different CWD can still find leftover plaintext.
 ///
-/// Deliberately excludes generic paths like `~/credentials`: other tools may
-/// store unrelated `{service}.json` files there, and guessing that root would
-/// let cleanup delete another application's data.
+/// Deliberately avoids walking arbitrary ancestors: a portable binary a few
+/// levels under the home directory (e.g. `~/Downloads/App/app`) must not guess
+/// `~/credentials`, where other tools may store schema-shaped JSON that cleanup
+/// would then delete.
 fn bootstrap_legacy_root_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let mut push = |p: PathBuf| {
@@ -305,15 +306,26 @@ fn bootstrap_legacy_root_candidates() -> Vec<PathBuf> {
     };
 
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(mut dir) = exe.parent().map(|p| p.to_path_buf()) {
-            push(dir.join("credentials"));
-            for _ in 0..4 {
-                match dir.parent() {
-                    Some(parent) => {
-                        dir = parent.to_path_buf();
-                        push(dir.join("credentials"));
+        if let Some(exe_dir) = exe.parent().map(|p| p.to_path_buf()) {
+            push(exe_dir.join("credentials"));
+
+            // macOS .app: .../Foo.app/Contents/MacOS/<exe>
+            // Only walk the known bundle parents — not generic ancestors.
+            let is_macos_bundle = exe_dir.components().any(|c| {
+                c.as_os_str()
+                    .to_str()
+                    .map(|s| s.ends_with(".app"))
+                    .unwrap_or(false)
+            }) && exe_dir.ends_with("Contents/MacOS");
+            if is_macos_bundle {
+                if let Some(contents) = exe_dir.parent() {
+                    push(contents.join("credentials"));
+                    if let Some(app_bundle) = contents.parent() {
+                        push(app_bundle.join("credentials"));
+                        if let Some(install_dir) = app_bundle.parent() {
+                            push(install_dir.join("credentials"));
+                        }
                     }
-                    None => break,
                 }
             }
         }
@@ -411,7 +423,28 @@ fn mark_credentials_deleted(service: &str) -> Result<(), String> {
         .as_millis();
     // Store the deletion instant so a later intentional save from an older build
     // (which cannot clear this marker) is not scrubbed as a pre-delete leftover.
-    fs::write(deletion_tombstone_path(service)?, millis.to_string()).map_err(|e| e.to_string())
+    // Atomic temp+rename so an interrupted write cannot leave a numeric prefix
+    // (e.g. "17") that would parse as a 1970-era cutoff.
+    let path = deletion_tombstone_path(service)?;
+    let tmp = dir.join(format!("{}.deleted.{}.tmp", service, std::process::id()));
+    fs::write(&tmp, millis.to_string()).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, &path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        e.to_string()
+    })
+}
+
+/// Earliest plausible deletion timestamp (2020-01-01 UTC). Truncated numeric
+/// prefixes like `17` decode to 1970-era cutoffs and must fail closed.
+const MIN_PLAUSIBLE_DELETION_SECS: u64 = 1_577_836_800;
+const MIN_PLAUSIBLE_DELETION_MILLIS: u128 = 1_577_836_800_000;
+/// Values below this are treated as unix seconds; at/above as milliseconds.
+const TOMBSTONE_SECONDS_CEILING: u128 = 10_000_000_000;
+
+fn quarantine_tombstone_as_now(service: &str) -> Result<SystemTime, String> {
+    let now = SystemTime::now();
+    let _ = mark_credentials_deleted(service);
+    Ok(now)
 }
 
 fn clear_credentials_deleted_marker(service: &str) -> Result<(), String> {
@@ -450,6 +483,8 @@ fn system_time_as_millis(t: SystemTime) -> u128 {
 /// Truncated or otherwise malformed markers also fail closed: treat them as an
 /// intentional deletion (cutoff = now) and rewrite a timed tombstone so a
 /// corrupted file cannot be mistaken for absence and remigrate stale JSON.
+/// Numeric prefixes from interrupted writes (e.g. `17`) are rejected the same
+/// way — they must not parse as 1970-era cutoffs.
 fn credentials_deleted_at(service: &str) -> Result<Option<SystemTime>, String> {
     let path = deletion_tombstone_path(service)?;
     let raw = match fs::read_to_string(&path) {
@@ -472,15 +507,20 @@ fn credentials_deleted_at(service: &str) -> Result<Option<SystemTime>, String> {
         Err(_) => {
             // Fail closed: preserve deletion suppression, then quarantine the
             // marker by rewriting a proper millisecond timestamp.
-            let now = SystemTime::now();
-            let _ = mark_credentials_deleted(service);
-            return Ok(Some(now));
+            return Ok(Some(quarantine_tombstone_as_now(service)?));
         }
     };
-    // Heuristic: values that fit in plausible unix-seconds stay seconds;
-    // larger values are milliseconds since epoch.
-    let duration = if value < 10_000_000_000 {
+    // Heuristic: values below the seconds/millis ceiling are unix-seconds;
+    // larger values are milliseconds. Reject implausible truncations (e.g. "17"
+    // from an interrupted write) that would become 1970-era cutoffs and allow
+    // remigration of pre-delete leftovers.
+    let duration = if value < TOMBSTONE_SECONDS_CEILING {
+        if value < u128::from(MIN_PLAUSIBLE_DELETION_SECS) {
+            return Ok(Some(quarantine_tombstone_as_now(service)?));
+        }
         Duration::from_secs(value as u64)
+    } else if value < MIN_PLAUSIBLE_DELETION_MILLIS {
+        return Ok(Some(quarantine_tombstone_as_now(service)?));
     } else {
         Duration::from_millis(value as u64)
     };
@@ -837,22 +877,31 @@ fn get_credentials_unlocked(service: &str) -> Result<Option<Credentials>, String
             if let Some(deleted_at) = credentials_deleted_at(service)? {
                 remove_legacy_files_with_cutoff(service, Some(deleted_at))?;
             }
-            if let Some((mut legacy, _)) = read_freshest_legacy_credentials(service)? {
-                // Always migrate and clean up under the requested service key.
-                // If the embedded service differs (copied/renamed file), normalize it
-                // so we do not leave the requested plaintext file behind or overwrite
-                // an unrelated keychain entry.
+            // Same stabilize loop as the keychain-hit path: older unlocked builds
+            // may rewrite plaintext after we snapshot it. Write keychain first,
+            // then delete only if the file is unchanged — never blind-delete via
+            // save_credentials_unlocked.
+            const MAX_LEGACY_STABILIZE_ATTEMPTS: u32 = 8;
+            let mut pending = read_freshest_legacy_credentials(service)?;
+            for _ in 0..MAX_LEGACY_STABILIZE_ATTEMPTS {
+                let Some((mut legacy, legacy_mtime)) = pending.take() else {
+                    return Ok(None);
+                };
                 normalize_legacy_service(service, &mut legacy);
-                // save_credentials_unlocked writes the keychain first, then
-                // deletes plaintext. We intentionally do not relocate into
-                // app-data before that write — a failed migrate must leave the
-                // original CWD source as the freshest copy for the next attempt.
-                // An intentional save/migrate also clears the deletion tombstone.
-                save_credentials_unlocked(service, &legacy.username, &legacy.password)?;
-                Ok(Some(legacy))
-            } else {
-                Ok(None)
+                write_keychain_credentials(service, &legacy.username, &legacy.password)?;
+                match remove_legacy_if_snapshot_unchanged(service, &legacy, legacy_mtime)? {
+                    LegacyCleanupOutcome::Cleared => return Ok(Some(legacy)),
+                    LegacyCleanupOutcome::Changed {
+                        credentials,
+                        mtime,
+                    } => {
+                        pending = Some((credentials, mtime));
+                    }
+                }
             }
+            Err(format!(
+                "legacy credentials for `{service}` kept changing during migration"
+            ))
         }
         Err(e) => Err(e.to_string()),
     }
@@ -868,6 +917,15 @@ fn delete_credentials_unlocked(service: &str) -> Result<(), String> {
         Ok(()) => {}
         Err(keyring::Error::NoEntry) => {}
         Err(e) => return Err(e.to_string()),
+    }
+    // Refresh the cutoff after keychain deletion completes. An older unlocked
+    // build may have written plaintext while delete_credential() ran; that
+    // file's mtime can post-date the first tombstone even though this delete
+    // finished later. Re-stamp and re-scrub so those mid-delete writes cannot
+    // remigrate as "intentional post-delete saves".
+    mark_credentials_deleted(service)?;
+    if let Some(deleted_at) = credentials_deleted_at(service)? {
+        remove_legacy_files_with_cutoff(service, Some(deleted_at))?;
     }
     Ok(())
 }
@@ -1556,6 +1614,66 @@ mod tests {
         );
 
         env::remove_var("CREDENTIALS_LEGACY_DIR");
+    }
+
+    #[test]
+    fn credentials_deleted_at_fails_closed_on_truncated_numeric_tombstone() {
+        let _guard = test_guard();
+        let legacy_root = tempfile::tempdir().unwrap();
+        env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
+        env::remove_var("CREDENTIALS_LEGACY_ROOTS");
+
+        let dir = legacy_credentials_app_data_dir().unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        let tombstone = deletion_tombstone_path("gemini").unwrap();
+        // Interrupted write of a millisecond timestamp can leave a short prefix
+        // that still parses as an integer — but as a 1970-era seconds cutoff.
+        fs::write(&tombstone, "17").unwrap();
+
+        let deleted_at = credentials_deleted_at("gemini")
+            .expect("truncated numeric tombstone must fail closed");
+        let cutoff = deleted_at.expect("must preserve deletion suppression");
+        let cutoff_secs = cutoff
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            cutoff_secs >= MIN_PLAUSIBLE_DELETION_SECS,
+            "quarantined cutoff must not be a 1970-era truncated parse, got {cutoff_secs}"
+        );
+
+        let rewritten: u128 = fs::read_to_string(&tombstone).unwrap().trim().parse().unwrap();
+        assert!(
+            rewritten >= MIN_PLAUSIBLE_DELETION_MILLIS,
+            "quarantine rewrite must be a plausible millisecond timestamp, got {rewritten}"
+        );
+
+        env::remove_var("CREDENTIALS_LEGACY_DIR");
+    }
+
+    #[test]
+    fn bootstrap_candidates_do_not_walk_arbitrary_ancestors() {
+        let candidates = bootstrap_legacy_root_candidates();
+        if let Ok(exe) = env::current_exe() {
+            if let Some(exe_dir) = exe.parent() {
+                let is_macos_bundle = exe_dir.ends_with("Contents/MacOS");
+                if !is_macos_bundle {
+                    // Non-bundle launches: only the exe directory itself.
+                    assert_eq!(
+                        candidates,
+                        vec![exe_dir.join("credentials")],
+                        "must not walk arbitrary parents outside a .app bundle"
+                    );
+                }
+            }
+        }
+        if let Some(home) = dirs::home_dir() {
+            let home_creds = home.join("credentials");
+            assert!(
+                !candidates.iter().any(|p| paths_equivalent(p, &home_creds)),
+                "generic ~/credentials must not be seeded by ancestor walk"
+            );
+        }
     }
 
     #[test]
