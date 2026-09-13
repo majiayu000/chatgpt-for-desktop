@@ -103,20 +103,81 @@ fn legacy_credentials_app_data_dir() -> Result<PathBuf, String> {
 ///
 /// Old builds only wrote `credentials/{service}.json` relative to their launch
 /// CWD and never used the app-data directory. Recording those absolute roots
-/// (and relocating discovered files into app-data) lets later launches from a
-/// different CWD still find and delete the original source.
+/// lets later launches from a different CWD still find and delete the original
+/// source. Relocating into app-data happens only after a successful keychain
+/// write so a failed migrate cannot prefer a stale relocated copy.
 fn legacy_roots_registry_path() -> Result<PathBuf, String> {
     Ok(legacy_credentials_app_data_dir()?.join("legacy-credential-roots.json"))
 }
 
-fn load_recorded_legacy_roots() -> Result<Vec<PathBuf>, String> {
+fn legacy_roots_registry_lock_path() -> Result<PathBuf, String> {
+    // Keep the registry lock beside the registry under the (overridable) legacy
+    // app-data dir so tests using CREDENTIALS_LEGACY_DIR stay isolated.
+    Ok(legacy_credentials_app_data_dir()?.join("legacy-roots-registry.lock"))
+}
+
+/// Inter-process lock for the shared roots registry read-modify-write path.
+/// Distinct from per-service locks so concurrent migrations of different
+/// services cannot clobber each other's recorded roots.
+fn with_registry_lock<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let lock_path = legacy_roots_registry_lock_path()?;
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create registry lock dir: {}", e))?;
+    }
+    let mut file_lock =
+        LockFile::open(&lock_path).map_err(|e| format!("open registry lock: {}", e))?;
+    file_lock
+        .lock()
+        .map_err(|e| format!("acquire registry lock: {}", e))?;
+    f()
+}
+
+fn write_legacy_roots_atomic(roots: &[PathBuf]) -> Result<(), String> {
+    let path = legacy_roots_registry_path()?;
+    let dir = legacy_credentials_app_data_dir()?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let encoded: Vec<String> = roots
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let tmp = dir.join(format!(
+        "legacy-credential-roots.{}.tmp",
+        std::process::id()
+    ));
+    fs::write(
+        &tmp,
+        serde_json::to_string(&encoded).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    // Same-directory rename is atomic on POSIX and replaces the target on
+    // Windows, avoiding a truncated/partial registry visible to other readers.
+    fs::rename(&tmp, &path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        e.to_string()
+    })
+}
+
+/// Load recorded roots. Malformed/partial registry content is quarantined and
+/// treated as empty so keychain-hit reads and deletes can still proceed and the
+/// registry can be rebuilt on the next successful discovery.
+fn load_recorded_legacy_roots_unlocked() -> Result<Vec<PathBuf>, String> {
     let path = legacy_roots_registry_path()?;
     if !path.exists() {
         return Ok(Vec::new());
     }
     let json = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let roots: Vec<String> = serde_json::from_str(&json).map_err(|e| e.to_string())?;
-    Ok(roots.into_iter().map(PathBuf::from).collect())
+    match serde_json::from_str::<Vec<String>>(&json) {
+        Ok(roots) => Ok(roots.into_iter().map(PathBuf::from).collect()),
+        Err(_) => {
+            let quarantine = path.with_extension("json.corrupt");
+            let _ = fs::rename(&path, &quarantine);
+            Ok(Vec::new())
+        }
+    }
+}
+
+fn load_recorded_legacy_roots() -> Result<Vec<PathBuf>, String> {
+    with_registry_lock(load_recorded_legacy_roots_unlocked)
 }
 
 fn record_legacy_root(root: &Path) -> Result<(), String> {
@@ -127,22 +188,88 @@ fn record_legacy_root(root: &Path) -> Result<(), String> {
             .map_err(|e| e.to_string())?
             .join(root)
     };
-    let mut roots = load_recorded_legacy_roots()?;
-    if roots.iter().any(|r| r == &abs) {
-        return Ok(());
+    let abs = fs::canonicalize(&abs).unwrap_or(abs);
+    with_registry_lock(|| {
+        let mut roots = load_recorded_legacy_roots_unlocked()?;
+        if roots.iter().any(|r| r == &abs) {
+            return Ok(());
+        }
+        roots.push(abs);
+        write_legacy_roots_atomic(&roots)
+    })
+}
+
+/// Historical launch locations that do not depend on a prior discovery write.
+///
+/// Old builds wrote relative to the process CWD. Typical CWDs for this desktop
+/// app include the executable directory (and a few parents for macOS `.app`
+/// bundles / nested launchers) plus the user home directory. These are seeded
+/// into the candidate list independently of the on-disk registry so a first
+/// upgraded launch from a different CWD can still find leftover plaintext.
+fn bootstrap_legacy_root_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut push = |p: PathBuf| {
+        if !p.as_os_str().is_empty() && !candidates.iter().any(|c| c == &p) {
+            candidates.push(p);
+        }
+    };
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(mut dir) = exe.parent().map(|p| p.to_path_buf()) {
+            push(dir.join("credentials"));
+            for _ in 0..4 {
+                match dir.parent() {
+                    Some(parent) => {
+                        dir = parent.to_path_buf();
+                        push(dir.join("credentials"));
+                    }
+                    None => break,
+                }
+            }
+        }
     }
-    roots.push(abs);
-    let dir = legacy_credentials_app_data_dir()?;
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let encoded: Vec<String> = roots
-        .iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-    fs::write(
-        legacy_roots_registry_path()?,
-        serde_json::to_string(&encoded).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())
+
+    if let Some(home) = dirs::home_dir() {
+        push(home.join("credentials"));
+    }
+
+    candidates
+}
+
+/// Persist bootstrap directories that already contain legacy JSON into the
+/// registry without waiting for a per-service read to discover them first.
+fn seed_registry_from_bootstrap_locations() -> Result<(), String> {
+    with_registry_lock(|| {
+        let mut roots = load_recorded_legacy_roots_unlocked()?;
+        let mut changed = false;
+        for candidate in bootstrap_legacy_root_candidates() {
+            if !candidate.is_dir() {
+                continue;
+            }
+            let has_json = fs::read_dir(&candidate)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok()).any(|e| {
+                        e.path()
+                            .extension()
+                            .map(|ext| ext == "json")
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+            if !has_json {
+                continue;
+            }
+            if roots.iter().any(|r| r == &candidate) {
+                continue;
+            }
+            roots.push(candidate);
+            changed = true;
+        }
+        if changed {
+            write_legacy_roots_atomic(&roots)?;
+        }
+        Ok(())
+    })
 }
 
 fn deletion_tombstone_path(service: &str) -> Result<PathBuf, String> {
@@ -171,6 +298,10 @@ fn credentials_were_deleted(service: &str) -> bool {
 
 /// Candidate directories that may contain `{service}.json` from older builds.
 fn legacy_credential_roots() -> Result<Vec<PathBuf>, String> {
+    // Establish known launch locations in the registry independently of a
+    // prior per-service discovery (first upgraded launch from another CWD).
+    seed_registry_from_bootstrap_locations()?;
+
     let mut roots = Vec::new();
     let mut seen = HashSet::new();
     let mut push = |p: PathBuf| {
@@ -179,19 +310,25 @@ fn legacy_credential_roots() -> Result<Vec<PathBuf>, String> {
         }
     };
 
-    // Relocated / stable copy — process-independent.
-    push(legacy_credentials_app_data_dir()?);
-
     // Historical launch CWD (absolute when available, plus relative fallback).
     if let Ok(cwd) = std::env::current_dir() {
         push(cwd.join("credentials"));
     }
     push(PathBuf::from("credentials"));
 
-    // Absolute roots discovered on prior launches (actual old CWDs).
+    // Executable / home bootstrap locations (independent of registry writes).
+    for root in bootstrap_legacy_root_candidates() {
+        push(root);
+    }
+
+    // Absolute roots discovered on prior launches or seeded from bootstrap.
     for root in load_recorded_legacy_roots()? {
         push(root);
     }
+
+    // Stable app-data copy — checked last so a fresher CWD/source file wins
+    // when callers resolve by modification time across all candidates.
+    push(legacy_credentials_app_data_dir()?);
 
     // Explicit known launch locations (tests / operators), OS path-separated.
     if let Ok(extra) = std::env::var("CREDENTIALS_LEGACY_ROOTS") {
@@ -216,26 +353,16 @@ fn legacy_credentials_paths(service: &str) -> Result<Vec<PathBuf>, String> {
         .collect())
 }
 
-/// Copy a discovered non-app-data legacy file into the stable app-data location
-/// and remember its absolute source directory for later cross-CWD delete/migrate.
-fn remember_and_relocate_legacy(service: &str, src: &Path) -> Result<(), String> {
+fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Record a discovered source root. Does not copy into app-data — relocating
+/// before a successful keychain write can leave a stale preferred copy.
+fn remember_legacy_source(src: &Path) -> Result<(), String> {
     if let Some(parent) = src.parent() {
         record_legacy_root(parent)?;
     }
-
-    let dest_dir = legacy_credentials_app_data_dir()?;
-    fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
-    let dest = dest_dir.join(format!("{}.json", service));
-
-    let same = match (fs::canonicalize(src), fs::canonicalize(&dest)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => src == dest,
-    };
-    if same {
-        return Ok(());
-    }
-
-    fs::copy(src, &dest).map_err(|e| format!("relocate legacy credentials: {}", e))?;
     Ok(())
 }
 
@@ -253,16 +380,28 @@ fn remove_legacy_file(service: &str) -> Result<(), String> {
 }
 
 /// Read a legacy plaintext credentials file from any supported location.
+///
+/// When multiple copies exist, prefer the newest by mtime so a stale app-data
+/// relocation cannot win over a later-updated CWD source. Discovery records the
+/// source root but does not relocate until keychain migration succeeds.
 pub fn read_legacy_credentials_file(service: &str) -> Result<Option<Credentials>, String> {
+    let mut best: Option<(PathBuf, std::time::SystemTime, Credentials)> = None;
+
     for path in legacy_credentials_paths(service)? {
         if !Path::new(&path).exists() {
             continue;
         }
         let json = fs::read_to_string(&path).map_err(|e| e.to_string())?;
         let credentials: Credentials = serde_json::from_str(&json).map_err(|e| e.to_string())?;
-        // Move the original CWD-relative source into app-data and record its
-        // absolute root so a later launch/delete from another CWD still finds it.
-        remember_and_relocate_legacy(service, &path)?;
+        let mtime = file_mtime(&path).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        match &best {
+            Some((_, best_mtime, _)) if mtime <= *best_mtime => {}
+            _ => best = Some((path, mtime, credentials)),
+        }
+    }
+
+    if let Some((path, _, credentials)) = best {
+        remember_legacy_source(&path)?;
         return Ok(Some(credentials));
     }
     Ok(None)
@@ -308,6 +447,10 @@ fn get_credentials_unlocked(service: &str) -> Result<Option<Credentials>, String
                 if legacy.service != service {
                     legacy.service = service.to_string();
                 }
+                // save_credentials_unlocked writes the keychain first, then
+                // deletes plaintext. We intentionally do not relocate into
+                // app-data before that write — a failed migrate must leave the
+                // original CWD source as the freshest copy for the next attempt.
                 save_credentials_unlocked(service, &legacy.username, &legacy.password)?;
                 Ok(Some(legacy))
             } else {
@@ -362,8 +505,22 @@ mod tests {
     // Serialize tests that touch the working directory / credentials folder.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn paths_equivalent(a: &Path, b: &Path) -> bool {
+        if a == b {
+            return true;
+        }
+        match (fs::canonicalize(a), fs::canonicalize(b)) {
+            (Ok(ca), Ok(cb)) => ca == cb,
+            _ => false,
+        }
+    }
+
     fn with_temp_cwd<F: FnOnce()>(f: F) {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_guard();
         let original = env::current_dir().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let legacy_root = tempfile::tempdir().unwrap();
@@ -432,7 +589,7 @@ mod tests {
     fn service_lock_allows_unlocked_helpers_while_held() {
         // Public APIs take the lock once; migration uses unlocked save so we
         // do not deadlock on a non-reentrant Mutex.
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_guard();
         let lock_root = tempfile::tempdir().unwrap();
         env::set_var("CREDENTIALS_LOCK_DIR", lock_root.path());
         let expected = lock_root.path().join("lock-test.lock");
@@ -468,7 +625,7 @@ mod tests {
 
     #[test]
     fn service_lock_path_is_independent_of_cwd() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_guard();
         let lock_root = tempfile::tempdir().unwrap();
         env::set_var("CREDENTIALS_LOCK_DIR", lock_root.path());
         let path_a = service_lock_path("gemini").unwrap();
@@ -486,7 +643,7 @@ mod tests {
 
     #[test]
     fn legacy_app_data_path_is_independent_of_cwd() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_guard();
         let legacy_root = tempfile::tempdir().unwrap();
         env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
         env::remove_var("CREDENTIALS_LEGACY_ROOTS");
@@ -499,8 +656,9 @@ mod tests {
         env::set_current_dir(original).unwrap();
         env::remove_var("CREDENTIALS_LEGACY_DIR");
 
-        assert_eq!(paths_a[0], paths_b[0]);
-        assert_eq!(paths_a[0], legacy_root.path().join("gemini.json"));
+        let app_data = legacy_root.path().join("gemini.json");
+        assert!(paths_a.iter().any(|p| p == &app_data));
+        assert!(paths_b.iter().any(|p| p == &app_data));
         // CWD-relative historical path remains a supported location.
         assert!(paths_a.iter().any(|p| p == &PathBuf::from("credentials/gemini.json")));
         assert!(paths_b.iter().any(|p| p == &PathBuf::from("credentials/gemini.json")));
@@ -508,7 +666,7 @@ mod tests {
 
     #[test]
     fn read_legacy_finds_app_data_file_from_other_cwd() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_guard();
         let legacy_root = tempfile::tempdir().unwrap();
         env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
         env::remove_var("CREDENTIALS_LEGACY_ROOTS");
@@ -541,7 +699,7 @@ mod tests {
         // Old builds only wrote CWD-relative credentials/{service}.json and never
         // the new app-data directory. A later launch from another CWD must still
         // find that original file via known/recorded legacy roots.
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_guard();
         let legacy_root = tempfile::tempdir().unwrap();
         env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
 
@@ -570,8 +728,10 @@ mod tests {
         assert!(!legacy_root.path().join("gemini.json").exists());
 
         let loaded = read_legacy_credentials_file("gemini").unwrap().unwrap();
-        // Discovery relocates into stable app-data for subsequent CWD-independent ops.
-        assert!(legacy_root.path().join("gemini.json").exists());
+        // Discovery records the source root but does not relocate before migrate.
+        assert!(!legacy_root.path().join("gemini.json").exists());
+        let recorded = load_recorded_legacy_roots().unwrap();
+        assert!(recorded.iter().any(|r| paths_equivalent(r, &old_creds_dir)));
         assert_eq!(loaded, sample);
 
         env::set_current_dir(original).unwrap();
@@ -581,7 +741,7 @@ mod tests {
 
     #[test]
     fn discovering_cwd_legacy_records_root_for_other_cwd() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_guard();
         let legacy_root = tempfile::tempdir().unwrap();
         env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
         env::remove_var("CREDENTIALS_LEGACY_ROOTS");
@@ -603,14 +763,18 @@ mod tests {
 
         let loaded = read_legacy_credentials_file("poe").unwrap().unwrap();
         assert_eq!(loaded, sample);
-        assert!(legacy_root.path().join("poe.json").exists());
+        // No pre-migrate relocate into app-data.
+        assert!(!legacy_root.path().join("poe.json").exists());
+        let recorded = load_recorded_legacy_roots().unwrap();
+        assert!(recorded
+            .iter()
+            .any(|r| paths_equivalent(r, &old_cwd.path().join("credentials"))));
 
-        // Switch away from the historical CWD; recorded root + relocated copy
-        // must still be deletable without re-launching from old_cwd.
+        // Switch away from the historical CWD; recorded root must still make
+        // the original file deletable without re-launching from old_cwd.
         let other_cwd = tempfile::tempdir().unwrap();
         env::set_current_dir(other_cwd.path()).unwrap();
         remove_legacy_file("poe").unwrap();
-        assert!(!legacy_root.path().join("poe.json").exists());
         assert!(!old_cwd.path().join("credentials/poe.json").exists());
 
         env::set_current_dir(original).unwrap();
@@ -618,8 +782,98 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_registry_is_quarantined_and_rebuildable() {
+        let _guard = test_guard();
+        let legacy_root = tempfile::tempdir().unwrap();
+        env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
+        env::remove_var("CREDENTIALS_LEGACY_ROOTS");
+
+        fs::create_dir_all(legacy_root.path()).unwrap();
+        let registry = legacy_root.path().join("legacy-credential-roots.json");
+        fs::write(&registry, b"{not-valid-json").unwrap();
+
+        // Parse failure must not block path enumeration / rebuild.
+        let roots = load_recorded_legacy_roots().unwrap();
+        assert!(roots.is_empty());
+        assert!(!registry.exists());
+        assert!(legacy_root
+            .path()
+            .join("legacy-credential-roots.json.corrupt")
+            .exists());
+
+        let original = env::current_dir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        env::set_current_dir(cwd.path()).unwrap();
+        fs::create_dir_all("credentials").unwrap();
+        fs::write(
+            "credentials/gemini.json",
+            r#"{"username":"u","password":"p","service":"gemini"}"#,
+        )
+        .unwrap();
+        let _ = read_legacy_credentials_file("gemini").unwrap().unwrap();
+        let rebuilt = load_recorded_legacy_roots().unwrap();
+        assert!(rebuilt.iter().any(|r| {
+            paths_equivalent(r, &cwd.path().join("credentials"))
+                || paths_equivalent(r, &env::current_dir().unwrap().join("credentials"))
+        }));
+
+        env::set_current_dir(original).unwrap();
+        env::remove_var("CREDENTIALS_LEGACY_DIR");
+    }
+
+    #[test]
+    fn prefers_fresher_cwd_source_over_stale_app_data_copy() {
+        let _guard = test_guard();
+        let legacy_root = tempfile::tempdir().unwrap();
+        env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
+        env::remove_var("CREDENTIALS_LEGACY_ROOTS");
+
+        let original = env::current_dir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        env::set_current_dir(cwd.path()).unwrap();
+        fs::create_dir_all("credentials").unwrap();
+
+        let stale = Credentials {
+            username: "old".into(),
+            password: "oldpass".into(),
+            service: "gemini".into(),
+        };
+        let fresh = Credentials {
+            username: "new".into(),
+            password: "newpass".into(),
+            service: "gemini".into(),
+        };
+        fs::write(
+            legacy_root.path().join("gemini.json"),
+            serde_json::to_string(&stale).unwrap(),
+        )
+        .unwrap();
+        // Ensure the CWD copy is newer than the app-data copy.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(
+            "credentials/gemini.json",
+            serde_json::to_string(&fresh).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = read_legacy_credentials_file("gemini").unwrap().unwrap();
+        assert_eq!(loaded, fresh);
+
+        env::set_current_dir(original).unwrap();
+        env::remove_var("CREDENTIALS_LEGACY_DIR");
+    }
+
+    #[test]
+    fn bootstrap_candidates_include_exe_relative_credentials() {
+        let candidates = bootstrap_legacy_root_candidates();
+        assert!(candidates.iter().any(|p| {
+            p.file_name().and_then(|n| n.to_str()) == Some("credentials")
+        }));
+    }
+
+    #[test]
     fn delete_tombstone_blocks_remigration_from_missed_cwd_file() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_guard();
         let legacy_root = tempfile::tempdir().unwrap();
         env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
         env::remove_var("CREDENTIALS_LEGACY_ROOTS");
@@ -649,7 +903,7 @@ mod tests {
         // get_credentials_unlocked path: tombstone => Ok(None) after scrub.
         // We exercise the helper directly to avoid keyring in unit tests.
         assert!(credentials_were_deleted("gemini"));
-        let _ = read_legacy_credentials_file("gemini"); // may relocate; tombstone still wins in get
+        let _ = read_legacy_credentials_file("gemini");
         assert!(credentials_were_deleted("gemini"));
 
         env::set_current_dir(original).unwrap();
@@ -658,7 +912,7 @@ mod tests {
 
     #[test]
     fn remove_legacy_clears_app_data_and_cwd_locations() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_guard();
         let legacy_root = tempfile::tempdir().unwrap();
         env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
         env::remove_var("CREDENTIALS_LEGACY_ROOTS");
