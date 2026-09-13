@@ -827,6 +827,41 @@ enum LegacyCleanupOutcome {
     },
 }
 
+/// Delete legacy files only when their contents+mtime still match `expected`.
+/// Unlike `remove_legacy_file`, this binds the unlink decision to the verified
+/// snapshot so a concurrent rewrite is left for reconciliation instead of
+/// discarded under a schema-only check.
+fn remove_legacy_matching_snapshot(
+    service: &str,
+    expected: &Credentials,
+    expected_mtime: SystemTime,
+) -> Result<(), String> {
+    for path in legacy_credentials_paths(service)? {
+        if !legacy_path_present(&path)? {
+            continue;
+        }
+        if !looks_like_app_legacy_credentials(&path)? {
+            continue;
+        }
+        let json = fs::read_to_string(&path).map_err(|e| {
+            format!("read legacy credentials {}: {}", path.display(), e)
+        })?;
+        let observed: Credentials = match serde_json::from_str(&json) {
+            Ok(c) => c,
+            // Foreign/malformed JSON is not our snapshot — leave it alone.
+            Err(_) => continue,
+        };
+        let mtime = file_mtime(&path).unwrap_or(UNIX_EPOCH);
+        if !legacy_snapshot_matches(service, expected, expected_mtime, &observed, mtime) {
+            // Different secret/mtime than the decision snapshot — do not delete.
+            continue;
+        }
+        remember_legacy_source(&path)?;
+        fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Re-read legacy credentials immediately before deletion. If an older build
 /// rewrote the file after our decision snapshot, refuse to delete and report
 /// the new snapshot so the caller can reconcile instead of discarding it.
@@ -850,7 +885,9 @@ fn remove_legacy_if_snapshot_unchanged(
                     mtime: observed_mtime,
                 });
             }
-            remove_legacy_file(service)?;
+            // Pass the verified snapshot into deletion so a rewrite between this
+            // check and unlink is not removed by a schema-only scrub.
+            remove_legacy_matching_snapshot(service, expected, expected_mtime)?;
             // An unlocked older build may rewrite during/after remove_file.
             match read_freshest_legacy_credentials(service)? {
                 None => Ok(LegacyCleanupOutcome::Cleared),
@@ -961,6 +998,29 @@ fn get_credentials_unlocked(service: &str) -> Result<Option<Credentials>, String
     }
 }
 
+/// Re-stamp the deletion tombstone and scrub legacy plaintext until none remain.
+///
+/// An older unlocked build may write after a refreshed tombstone is stamped but
+/// before/during scrub; that file's mtime can exceed `deleted_at` and be
+/// preserved, reversing the delete on the next no-entry lookup. Repeat until
+/// stable, then force a cutoff-free scrub so writes preceding return cannot
+/// remigrate.
+fn stamp_and_scrub_deleted_legacy(service: &str) -> Result<(), String> {
+    const MAX_DELETE_STABILIZE_ATTEMPTS: u32 = 8;
+    for _ in 0..MAX_DELETE_STABILIZE_ATTEMPTS {
+        mark_credentials_deleted(service)?;
+        if let Some(deleted_at) = credentials_deleted_at(service)? {
+            remove_legacy_files_with_cutoff(service, Some(deleted_at))?;
+        }
+        if read_freshest_legacy_credentials(service)?.is_none() {
+            return Ok(());
+        }
+    }
+    mark_credentials_deleted(service)?;
+    remove_legacy_file(service)?;
+    Ok(())
+}
+
 fn delete_credentials_unlocked(service: &str) -> Result<(), String> {
     remove_legacy_file(service)?;
     // Tombstone survives even if some historical CWD file was not yet recorded,
@@ -972,16 +1032,9 @@ fn delete_credentials_unlocked(service: &str) -> Result<(), String> {
         Err(keyring::Error::NoEntry) => {}
         Err(e) => return Err(e.to_string()),
     }
-    // Refresh the cutoff after keychain deletion completes. An older unlocked
-    // build may have written plaintext while delete_credential() ran; that
-    // file's mtime can post-date the first tombstone even though this delete
-    // finished later. Re-stamp and re-scrub so those mid-delete writes cannot
-    // remigrate as "intentional post-delete saves".
-    mark_credentials_deleted(service)?;
-    if let Some(deleted_at) = credentials_deleted_at(service)? {
-        remove_legacy_files_with_cutoff(service, Some(deleted_at))?;
-    }
-    Ok(())
+    // Refresh after keychain deletion: mid-delete plaintext writes must not
+    // outlive this function as "intentional post-delete saves".
+    stamp_and_scrub_deleted_legacy(service)
 }
 
 /// Store credentials in the OS keychain and remove any leftover plaintext file.
@@ -1974,6 +2027,84 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn remove_legacy_matching_snapshot_skips_rewritten_file() {
+        with_temp_cwd(|| {
+            fs::create_dir_all("credentials").unwrap();
+            let path = PathBuf::from("credentials/gemini.json");
+            fs::write(
+                &path,
+                r#"{"username":"old","password":"oldpass","service":"gemini"}"#,
+            )
+            .unwrap();
+            let (expected, expected_mtime) = read_freshest_legacy_credentials("gemini")
+                .unwrap()
+                .expect("legacy present");
+
+            // Concurrent rewrite after the decision snapshot was taken.
+            fs::write(
+                &path,
+                r#"{"username":"fresh","password":"newpass","service":"gemini"}"#,
+            )
+            .unwrap();
+
+            remove_legacy_matching_snapshot("gemini", &expected, expected_mtime).unwrap();
+
+            assert!(
+                path.exists(),
+                "deletion must not remove a file that no longer matches the verified snapshot"
+            );
+            let json = fs::read_to_string(&path).unwrap();
+            assert!(
+                json.contains("fresh") && json.contains("newpass"),
+                "concurrent update must be preserved, got {json}"
+            );
+        });
+    }
+
+    #[test]
+    fn stamp_and_scrub_clears_rewrite_newer_than_early_tombstone() {
+        let _guard = test_guard();
+        let legacy_root = tempfile::tempdir().unwrap();
+        env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
+        env::remove_var("CREDENTIALS_LEGACY_ROOTS");
+
+        let path = legacy_root.path().join("gemini.json");
+        fs::write(
+            &path,
+            r#"{"username":"u","password":"p","service":"gemini"}"#,
+        )
+        .unwrap();
+
+        // Early tombstone + later rewrite: a single cutoff scrub preserves the file.
+        mark_credentials_deleted("gemini").unwrap();
+        let early = credentials_deleted_at("gemini").unwrap().expect("tombstone");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(
+            &path,
+            r#"{"username":"race","password":"during-delete","service":"gemini"}"#,
+        )
+        .unwrap();
+        remove_legacy_files_with_cutoff("gemini", Some(early)).unwrap();
+        assert!(
+            path.exists(),
+            "precondition: rewrite newer than early tombstone must survive one scrub"
+        );
+
+        stamp_and_scrub_deleted_legacy("gemini").unwrap();
+
+        assert!(
+            !path.exists(),
+            "stabilize stamp/scrub must clear mid-delete rewrites before returning"
+        );
+        assert!(
+            credentials_deleted_at("gemini").unwrap().is_some(),
+            "tombstone must remain after stabilize"
+        );
+
+        env::remove_var("CREDENTIALS_LEGACY_DIR");
     }
 
     #[test]
