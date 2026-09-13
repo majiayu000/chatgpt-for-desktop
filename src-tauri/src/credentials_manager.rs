@@ -61,8 +61,9 @@ pub fn get_credentials(service: &str) -> Result<Option<Credentials>, String> {
     match entry.get_password() {
         Ok(json) => {
             let credentials: Credentials = serde_json::from_str(&json).map_err(|e| e.to_string())?;
-            // Clean up any leftover plaintext file after a successful keychain read.
-            let _ = remove_legacy_file(service);
+            // Surface leftover-plaintext cleanup failures so migration cannot leave
+            // credentials/{service}.json on disk indefinitely after a keychain hit.
+            remove_legacy_file(service)?;
             Ok(Some(credentials))
         }
         Err(keyring::Error::NoEntry) => {
