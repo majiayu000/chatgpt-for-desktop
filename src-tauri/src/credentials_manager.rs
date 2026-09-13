@@ -21,11 +21,30 @@ pub struct Credentials {
 /// `delete_credentials` concurrently; without this, an in-flight legacy
 /// migration can recreate a keychain entry after a completed deletion.
 ///
-/// Combines a process-local mutex with an inter-process file lock so two
-/// app instances sharing the same working directory cannot race migrate/delete.
+/// Combines a process-local mutex with an inter-process file lock under a
+/// shared writable application-data directory (not CWD), so instances launched
+/// from different working directories — including read-only installs — still
+/// serialize migrate/delete against the same OS keychain account.
 static SERVICE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 
-fn service_lock_path(service: &str) -> PathBuf {
+/// Writable, process-independent directory for per-service lock files.
+///
+/// Prefer the OS application-data location keyed by the Tauri/app identifier so
+/// all instances share one lock namespace. Tests may override via
+/// `CREDENTIALS_LOCK_DIR`.
+fn credential_locks_dir() -> Result<PathBuf, String> {
+    if let Ok(dir) = std::env::var("CREDENTIALS_LOCK_DIR") {
+        if !dir.is_empty() {
+            return Ok(PathBuf::from(dir));
+        }
+    }
+    let base = dirs::data_local_dir().ok_or_else(|| {
+        "no writable application data directory for credential locks".to_string()
+    })?;
+    Ok(base.join(KEYRING_SERVICE).join("credential-locks"))
+}
+
+fn service_lock_path(service: &str) -> Result<PathBuf, String> {
     // Keep lock names flat even if a service string contains path separators.
     let safe: String = service
         .chars()
@@ -37,9 +56,7 @@ fn service_lock_path(service: &str) -> PathBuf {
             }
         })
         .collect();
-    PathBuf::from("credentials")
-        .join(".locks")
-        .join(format!("{}.lock", safe))
+    Ok(credential_locks_dir()?.join(format!("{}.lock", safe)))
 }
 
 fn with_service_lock<T>(service: &str, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
@@ -52,7 +69,7 @@ fn with_service_lock<T>(service: &str, f: impl FnOnce() -> Result<T, String>) ->
     };
     let _guard = service_lock.lock().unwrap_or_else(|e| e.into_inner());
 
-    let lock_path = service_lock_path(service);
+    let lock_path = service_lock_path(service)?;
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create lock dir: {}", e))?;
     }
@@ -240,16 +257,55 @@ mod tests {
     fn service_lock_allows_unlocked_helpers_while_held() {
         // Public APIs take the lock once; migration uses unlocked save so we
         // do not deadlock on a non-reentrant Mutex.
-        with_temp_cwd(|| {
-            let mut ran = false;
-            with_service_lock("lock-test", || {
-                let _ = save_credentials_unlocked as fn(&str, &str, &str) -> Result<(), String>;
-                ran = true;
-                Ok(())
-            })
-            .unwrap();
-            assert!(ran);
-            assert!(Path::new("credentials/.locks/lock-test.lock").exists());
+        let _guard = TEST_LOCK.lock().unwrap();
+        let lock_root = tempfile::tempdir().unwrap();
+        env::set_var("CREDENTIALS_LOCK_DIR", lock_root.path());
+        let expected = lock_root.path().join("lock-test.lock");
+
+        // Read-only CWD must not block lock acquisition (install-dir case).
+        let original = env::current_dir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        env::set_current_dir(tmp.path()).unwrap();
+        let cwd = env::current_dir().unwrap();
+        let mut perms = fs::metadata(&cwd).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&cwd, perms).unwrap();
+
+        let mut ran = false;
+        let result = with_service_lock("lock-test", || {
+            let _ = save_credentials_unlocked as fn(&str, &str, &str) -> Result<(), String>;
+            ran = true;
+            Ok(())
         });
+
+        // Restore writability before leaving the temp CWD.
+        let mut perms = fs::metadata(&cwd).unwrap().permissions();
+        perms.set_readonly(false);
+        fs::set_permissions(&cwd, perms).unwrap();
+        env::set_current_dir(original).unwrap();
+        env::remove_var("CREDENTIALS_LOCK_DIR");
+
+        result.unwrap();
+        assert!(ran);
+        assert!(expected.exists());
+        assert!(!tmp.path().join("credentials/.locks/lock-test.lock").exists());
+    }
+
+    #[test]
+    fn service_lock_path_is_independent_of_cwd() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let lock_root = tempfile::tempdir().unwrap();
+        env::set_var("CREDENTIALS_LOCK_DIR", lock_root.path());
+        let path_a = service_lock_path("gemini").unwrap();
+
+        let original = env::current_dir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        env::set_current_dir(tmp.path()).unwrap();
+        let path_b = service_lock_path("gemini").unwrap();
+        env::set_current_dir(original).unwrap();
+        env::remove_var("CREDENTIALS_LOCK_DIR");
+
+        assert_eq!(path_a, path_b);
+        assert_eq!(path_a, lock_root.path().join("gemini.lock"));
     }
 }
