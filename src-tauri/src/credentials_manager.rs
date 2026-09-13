@@ -304,15 +304,17 @@ fn record_legacy_root(root: &Path) -> Result<(), String> {
 /// Historical launch locations that do not depend on a prior discovery write.
 ///
 /// Old builds wrote relative to the process CWD. Typical CWDs for this desktop
-/// app include the executable directory and, on macOS, the `.app` bundle layout
-/// (`Foo.app/Contents/MacOS`). These are seeded into the candidate list
-/// independently of the on-disk registry so a first upgraded launch from a
-/// different CWD can still find leftover plaintext.
+/// app include the executable directory and, on macOS, locations *inside* the
+/// `.app` bundle (`Foo.app/Contents/MacOS`, `Foo.app/Contents`, `Foo.app`).
+/// These are seeded into the candidate list independently of the on-disk
+/// registry so a first upgraded launch from a different CWD can still find
+/// leftover plaintext.
 ///
-/// Deliberately avoids walking arbitrary ancestors: a portable binary a few
-/// levels under the home directory (e.g. `~/Downloads/App/app`) must not guess
-/// `~/credentials`, where other tools may store schema-shaped JSON that cleanup
-/// would then delete.
+/// Deliberately avoids install-directory and arbitrary-ancestor guesses: a
+/// bundle under `~/Downloads/Foo.app` must not treat `~/Downloads/credentials`
+/// as ours, and a portable binary a few levels under home must not guess
+/// `~/credentials`. Other tools may store schema-shaped JSON there that
+/// cleanup would then delete.
 fn bootstrap_legacy_root_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let mut push = |p: PathBuf| {
@@ -324,30 +326,41 @@ fn bootstrap_legacy_root_candidates() -> Vec<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent().map(|p| p.to_path_buf()) {
             push(exe_dir.join("credentials"));
-
-            // macOS .app: .../Foo.app/Contents/MacOS/<exe>
-            // Only walk the known bundle parents — not generic ancestors.
-            let is_macos_bundle = exe_dir.components().any(|c| {
-                c.as_os_str()
-                    .to_str()
-                    .map(|s| s.ends_with(".app"))
-                    .unwrap_or(false)
-            }) && exe_dir.ends_with("Contents/MacOS");
-            if is_macos_bundle {
-                if let Some(contents) = exe_dir.parent() {
-                    push(contents.join("credentials"));
-                    if let Some(app_bundle) = contents.parent() {
-                        push(app_bundle.join("credentials"));
-                        if let Some(install_dir) = app_bundle.parent() {
-                            push(install_dir.join("credentials"));
-                        }
-                    }
-                }
+            for root in macos_bundle_internal_legacy_roots(&exe_dir) {
+                push(root);
             }
         }
     }
 
     candidates
+}
+
+/// Legacy credential dirs that stay inside a macOS `.app` bundle.
+///
+/// Given `.../Foo.app/Contents/MacOS`, returns `Contents/credentials` and
+/// `Foo.app/credentials` only — never the install parent (e.g. `~/Downloads`).
+fn macos_bundle_internal_legacy_roots(exe_dir: &Path) -> Vec<PathBuf> {
+    let is_macos_bundle = exe_dir.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .map(|s| s.ends_with(".app"))
+            .unwrap_or(false)
+    }) && exe_dir.ends_with("Contents/MacOS");
+    if !is_macos_bundle {
+        return Vec::new();
+    }
+
+    let mut roots = Vec::new();
+    if let Some(contents) = exe_dir.parent() {
+        roots.push(contents.join("credentials"));
+        if let Some(app_bundle) = contents.parent() {
+            roots.push(app_bundle.join("credentials"));
+            // Intentionally omit app_bundle.parent()/credentials — that is the
+            // install directory (Downloads, Desktop, /Applications, …), not an
+            // application-owned legacy location.
+        }
+    }
+    roots
 }
 
 /// True when `path` deserializes as this app's legacy `Credentials` JSON.
@@ -1875,6 +1888,19 @@ mod tests {
                         vec![exe_dir.join("credentials")],
                         "must not walk arbitrary parents outside a .app bundle"
                     );
+                } else if let Some(install_dir) = exe_dir
+                    .parent() // Contents
+                    .and_then(|c| c.parent()) // Foo.app
+                    .and_then(|app| app.parent())
+                {
+                    let install_creds = install_dir.join("credentials");
+                    assert!(
+                        !candidates
+                            .iter()
+                            .any(|p| paths_equivalent(p, &install_creds)),
+                        "install-dir credentials ({}) must not be a guessed legacy root",
+                        install_creds.display()
+                    );
                 }
             }
         }
@@ -1885,6 +1911,28 @@ mod tests {
                 "generic ~/credentials must not be seeded by ancestor walk"
             );
         }
+    }
+
+    #[test]
+    fn macos_bundle_roots_stay_inside_app_not_install_parent() {
+        let macos = PathBuf::from("/Users/me/Downloads/ChatGPT.app/Contents/MacOS");
+        let roots = macos_bundle_internal_legacy_roots(&macos);
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/Users/me/Downloads/ChatGPT.app/Contents/credentials"),
+                PathBuf::from("/Users/me/Downloads/ChatGPT.app/credentials"),
+            ]
+        );
+        assert!(
+            !roots
+                .iter()
+                .any(|p| p == &PathBuf::from("/Users/me/Downloads/credentials")),
+            "must not treat the .app install parent as a legacy root"
+        );
+
+        let non_bundle = PathBuf::from("/Users/me/Downloads/App/bin");
+        assert!(macos_bundle_internal_legacy_roots(&non_bundle).is_empty());
     }
 
     #[test]
