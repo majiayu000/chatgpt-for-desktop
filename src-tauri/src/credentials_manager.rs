@@ -203,9 +203,13 @@ fn record_legacy_root(root: &Path) -> Result<(), String> {
 ///
 /// Old builds wrote relative to the process CWD. Typical CWDs for this desktop
 /// app include the executable directory (and a few parents for macOS `.app`
-/// bundles / nested launchers) plus the user home directory. These are seeded
-/// into the candidate list independently of the on-disk registry so a first
-/// upgraded launch from a different CWD can still find leftover plaintext.
+/// bundles / nested launchers). These are seeded into the candidate list
+/// independently of the on-disk registry so a first upgraded launch from a
+/// different CWD can still find leftover plaintext.
+///
+/// Deliberately excludes generic paths like `~/credentials`: other tools may
+/// store unrelated `{service}.json` files there, and guessing that root would
+/// let cleanup delete another application's data.
 fn bootstrap_legacy_root_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let mut push = |p: PathBuf| {
@@ -229,15 +233,23 @@ fn bootstrap_legacy_root_candidates() -> Vec<PathBuf> {
         }
     }
 
-    if let Some(home) = dirs::home_dir() {
-        push(home.join("credentials"));
-    }
-
     candidates
 }
 
-/// Persist bootstrap directories that already contain legacy JSON into the
-/// registry without waiting for a per-service read to discover them first.
+/// True when `path` deserializes as this app's legacy `Credentials` JSON.
+///
+/// Used before deleting or seeding so unrelated `{service}.json` files (for
+/// example under a shared `credentials/` directory used by another tool) are
+/// left alone.
+fn looks_like_app_legacy_credentials(path: &Path) -> bool {
+    let Ok(json) = fs::read_to_string(path) else {
+        return false;
+    };
+    serde_json::from_str::<Credentials>(&json).is_ok()
+}
+
+/// Persist bootstrap directories that already contain this app's legacy
+/// credential JSON into the registry without waiting for a per-service read.
 fn seed_registry_from_bootstrap_locations() -> Result<(), String> {
     with_registry_lock(|| {
         let mut roots = load_recorded_legacy_roots_unlocked()?;
@@ -246,17 +258,19 @@ fn seed_registry_from_bootstrap_locations() -> Result<(), String> {
             if !candidate.is_dir() {
                 continue;
             }
-            let has_json = fs::read_dir(&candidate)
+            // Require confirmed app credential JSON, not any `.json` file.
+            let has_app_legacy = fs::read_dir(&candidate)
                 .map(|rd| {
                     rd.filter_map(|e| e.ok()).any(|e| {
-                        e.path()
-                            .extension()
+                        let path = e.path();
+                        path.extension()
                             .map(|ext| ext == "json")
                             .unwrap_or(false)
+                            && looks_like_app_legacy_credentials(&path)
                     })
                 })
                 .unwrap_or(false);
-            if !has_json {
+            if !has_app_legacy {
                 continue;
             }
             if roots.iter().any(|r| r == &candidate) {
@@ -316,7 +330,7 @@ fn legacy_credential_roots() -> Result<Vec<PathBuf>, String> {
     }
     push(PathBuf::from("credentials"));
 
-    // Executable / home bootstrap locations (independent of registry writes).
+    // Executable-relative bootstrap locations (independent of registry writes).
     for root in bootstrap_legacy_root_candidates() {
         push(root);
     }
@@ -372,9 +386,16 @@ fn keyring_entry(service: &str) -> Result<Entry, String> {
 
 fn remove_legacy_file(service: &str) -> Result<(), String> {
     for path in legacy_credentials_paths(service)? {
-        if path.exists() {
-            fs::remove_file(&path).map_err(|e| e.to_string())?;
+        if !path.exists() {
+            continue;
         }
+        // Only delete files that parse as this app's legacy credentials schema.
+        // Unrelated tools may use the same `{service}.json` filename under a
+        // shared directory; deleting those would destroy other apps' data.
+        if !looks_like_app_legacy_credentials(&path) {
+            continue;
+        }
+        fs::remove_file(&path).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -869,6 +890,43 @@ mod tests {
         assert!(candidates.iter().any(|p| {
             p.file_name().and_then(|n| n.to_str()) == Some("credentials")
         }));
+    }
+
+    #[test]
+    fn bootstrap_candidates_exclude_generic_home_credentials() {
+        let candidates = bootstrap_legacy_root_candidates();
+        if let Some(home) = dirs::home_dir() {
+            let home_creds = home.join("credentials");
+            assert!(
+                !candidates.iter().any(|p| paths_equivalent(p, &home_creds)),
+                "generic ~/credentials must not be a guessed legacy root"
+            );
+        }
+    }
+
+    #[test]
+    fn remove_legacy_skips_unrelated_json_without_app_schema() {
+        with_temp_cwd(|| {
+            fs::create_dir_all("credentials").unwrap();
+            let foreign = PathBuf::from("credentials/gemini.json");
+            // Other tools may use the same filename with a different schema.
+            fs::write(&foreign, r#"{"api_key":"sk-foreign","project":"other-app"}"#).unwrap();
+
+            remove_legacy_file("gemini").unwrap();
+            assert!(
+                foreign.exists(),
+                "unrelated JSON must not be deleted without provenance"
+            );
+
+            // App-shaped legacy files are still cleaned up.
+            fs::write(
+                &foreign,
+                r#"{"username":"u","password":"p","service":"gemini"}"#,
+            )
+            .unwrap();
+            remove_legacy_file("gemini").unwrap();
+            assert!(!foreign.exists());
+        });
     }
 
     #[test]
