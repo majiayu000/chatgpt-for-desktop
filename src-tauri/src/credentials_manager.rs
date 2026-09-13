@@ -446,6 +446,10 @@ fn system_time_as_millis(t: SystemTime) -> u128 {
 /// `NotFound` means no deletion occurred. Other tombstone read/stat I/O errors
 /// propagate so a locked or unreadable marker cannot be mistaken for "absent"
 /// and allow a stale legacy file to remigrate.
+///
+/// Truncated or otherwise malformed markers also fail closed: treat them as an
+/// intentional deletion (cutoff = now) and rewrite a timed tombstone so a
+/// corrupted file cannot be mistaken for absence and remigrate stale JSON.
 fn credentials_deleted_at(service: &str) -> Result<Option<SystemTime>, String> {
     let path = deletion_tombstone_path(service)?;
     let raw = match fs::read_to_string(&path) {
@@ -465,7 +469,13 @@ fn credentials_deleted_at(service: &str) -> Result<Option<SystemTime>, String> {
     }
     let value: u128 = match trimmed.parse() {
         Ok(v) => v,
-        Err(_) => return Ok(None),
+        Err(_) => {
+            // Fail closed: preserve deletion suppression, then quarantine the
+            // marker by rewriting a proper millisecond timestamp.
+            let now = SystemTime::now();
+            let _ = mark_credentials_deleted(service);
+            return Ok(Some(now));
+        }
     };
     // Heuristic: values that fit in plausible unix-seconds stay seconds;
     // larger values are milliseconds since epoch.
@@ -670,39 +680,154 @@ pub fn read_legacy_credentials_file(service: &str) -> Result<Option<Credentials>
     Ok(read_freshest_legacy_credentials(service)?.map(|(c, _)| c))
 }
 
-fn save_credentials_unlocked(service: &str, username: &str, password: &str) -> Result<(), String> {
+/// Write the keychain entry and clear any deletion tombstone without touching
+/// legacy plaintext. Callers that race with older unlocked builds must recheck
+/// the plaintext snapshot before deleting it.
+fn write_keychain_credentials(
+    service: &str,
+    username: &str,
+    password: &str,
+) -> Result<KeychainPayload, String> {
     let payload = KeychainPayload::from_credentials(username, password, service);
     let json = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
     let entry = keyring_entry(service)?;
     entry.set_password(&json).map_err(|e| e.to_string())?;
     // Intentional save after delete clears the anti-resurrection tombstone.
     clear_credentials_deleted_marker(service)?;
+    Ok(payload)
+}
+
+fn save_credentials_unlocked(service: &str, username: &str, password: &str) -> Result<(), String> {
+    write_keychain_credentials(service, username, password)?;
     remove_legacy_file(service)?;
     Ok(())
+}
+
+/// Whether two legacy observations refer to the same secret snapshot.
+fn legacy_snapshot_matches(
+    service: &str,
+    expected: &Credentials,
+    expected_mtime: SystemTime,
+    observed: &Credentials,
+    observed_mtime: SystemTime,
+) -> bool {
+    let mut left = expected.clone();
+    let mut right = observed.clone();
+    if left.service != service {
+        left.service = service.to_string();
+    }
+    if right.service != service {
+        right.service = service.to_string();
+    }
+    left == right && system_time_as_millis(expected_mtime) == system_time_as_millis(observed_mtime)
+}
+
+/// Outcome of attempting to remove legacy plaintext after a prior decision.
+enum LegacyCleanupOutcome {
+    /// No legacy file remained (or it matched and was removed).
+    Cleared,
+    /// File identity/mtime/content changed since the decision; caller must retry.
+    Changed {
+        credentials: Credentials,
+        mtime: SystemTime,
+    },
+}
+
+/// Re-read legacy credentials immediately before deletion. If an older build
+/// rewrote the file after our decision snapshot, refuse to delete and report
+/// the new snapshot so the caller can reconcile instead of discarding it.
+fn remove_legacy_if_snapshot_unchanged(
+    service: &str,
+    expected: &Credentials,
+    expected_mtime: SystemTime,
+) -> Result<LegacyCleanupOutcome, String> {
+    match read_freshest_legacy_credentials(service)? {
+        None => Ok(LegacyCleanupOutcome::Cleared),
+        Some((observed, observed_mtime)) => {
+            if !legacy_snapshot_matches(
+                service,
+                expected,
+                expected_mtime,
+                &observed,
+                observed_mtime,
+            ) {
+                return Ok(LegacyCleanupOutcome::Changed {
+                    credentials: observed,
+                    mtime: observed_mtime,
+                });
+            }
+            remove_legacy_file(service)?;
+            // An unlocked older build may rewrite during/after remove_file.
+            match read_freshest_legacy_credentials(service)? {
+                None => Ok(LegacyCleanupOutcome::Cleared),
+                Some((again, again_mtime)) => Ok(LegacyCleanupOutcome::Changed {
+                    credentials: again,
+                    mtime: again_mtime,
+                }),
+            }
+        }
+    }
+}
+
+/// Normalize embedded service to the lookup key used for migration/cleanup.
+fn normalize_legacy_service(service: &str, legacy: &mut Credentials) {
+    if legacy.service != service {
+        legacy.service = service.to_string();
+    }
 }
 
 fn get_credentials_unlocked(service: &str) -> Result<Option<Credentials>, String> {
     let entry = keyring_entry(service)?;
     match entry.get_password() {
         Ok(json) => {
-            let payload: KeychainPayload =
+            let mut payload: KeychainPayload =
                 serde_json::from_str(&json).map_err(|e| e.to_string())?;
-            // If a newer legacy plaintext exists (e.g. user saved via an older
-            // build after the keychain entry was created), promote it before
-            // cleanup so the intentional update is not discarded.
-            if let Some((mut legacy, legacy_mtime)) = read_freshest_legacy_credentials(service)? {
-                if legacy.service != service {
-                    legacy.service = service.to_string();
-                }
+            // Older builds do not take our inter-process lock. Re-check the
+            // legacy snapshot immediately before every delete/reconcile so a
+            // concurrent plaintext rewrite is promoted instead of discarded.
+            const MAX_LEGACY_STABILIZE_ATTEMPTS: u32 = 8;
+            let mut pending: Option<(Credentials, SystemTime)> =
+                read_freshest_legacy_credentials(service)?;
+            for _ in 0..MAX_LEGACY_STABILIZE_ATTEMPTS {
+                let Some((mut legacy, legacy_mtime)) = pending.take() else {
+                    return Ok(Some(payload.into_credentials()));
+                };
+                normalize_legacy_service(service, &mut legacy);
                 if should_reconcile_legacy_over_keychain(&payload, &legacy, legacy_mtime) {
-                    save_credentials_unlocked(service, &legacy.username, &legacy.password)?;
-                    return Ok(Some(legacy));
+                    // Write keychain first without deleting plaintext, then
+                    // remove only if the file still matches this snapshot.
+                    payload = write_keychain_credentials(
+                        service,
+                        &legacy.username,
+                        &legacy.password,
+                    )?;
+                    match remove_legacy_if_snapshot_unchanged(service, &legacy, legacy_mtime)? {
+                        LegacyCleanupOutcome::Cleared => return Ok(Some(legacy)),
+                        LegacyCleanupOutcome::Changed {
+                            credentials,
+                            mtime,
+                        } => {
+                            pending = Some((credentials, mtime));
+                            continue;
+                        }
+                    }
+                }
+                // Same-secret (or older) leftover: delete only if unchanged.
+                match remove_legacy_if_snapshot_unchanged(service, &legacy, legacy_mtime)? {
+                    LegacyCleanupOutcome::Cleared => {
+                        return Ok(Some(payload.into_credentials()));
+                    }
+                    LegacyCleanupOutcome::Changed {
+                        credentials,
+                        mtime,
+                    } => {
+                        pending = Some((credentials, mtime));
+                    }
                 }
             }
-            // Surface leftover-plaintext cleanup failures so migration cannot leave
-            // credentials/{service}.json on disk indefinitely after a keychain hit.
-            remove_legacy_file(service)?;
-            Ok(Some(payload.into_credentials()))
+            Err(format!(
+                "legacy credentials for `{service}` kept changing during cleanup"
+            ))
         }
         Err(keyring::Error::NoEntry) => {
             // A prior delete that could not see every historical CWD must not be
@@ -717,9 +842,7 @@ fn get_credentials_unlocked(service: &str) -> Result<Option<Credentials>, String
                 // If the embedded service differs (copied/renamed file), normalize it
                 // so we do not leave the requested plaintext file behind or overwrite
                 // an unrelated keychain entry.
-                if legacy.service != service {
-                    legacy.service = service.to_string();
-                }
+                normalize_legacy_service(service, &mut legacy);
                 // save_credentials_unlocked writes the keychain first, then
                 // deletes plaintext. We intentionally do not relocate into
                 // app-data before that write — a failed migrate must leave the
@@ -1404,6 +1527,76 @@ mod tests {
 
         env::set_current_dir(original).unwrap();
         env::remove_var("CREDENTIALS_LEGACY_DIR");
+    }
+
+    #[test]
+    fn credentials_deleted_at_fails_closed_on_malformed_tombstone() {
+        let _guard = test_guard();
+        let legacy_root = tempfile::tempdir().unwrap();
+        env::set_var("CREDENTIALS_LEGACY_DIR", legacy_root.path());
+        env::remove_var("CREDENTIALS_LEGACY_ROOTS");
+
+        let dir = legacy_credentials_app_data_dir().unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        let tombstone = deletion_tombstone_path("gemini").unwrap();
+        fs::write(&tombstone, "not-a-timestamp").unwrap();
+
+        let deleted_at = credentials_deleted_at("gemini")
+            .expect("malformed tombstone must fail closed, not look absent");
+        assert!(
+            deleted_at.is_some(),
+            "malformed marker must preserve deletion suppression"
+        );
+
+        // Quarantine rewrite should leave a parseable millisecond timestamp.
+        let rewritten = fs::read_to_string(&tombstone).unwrap();
+        assert!(
+            rewritten.trim().parse::<u128>().is_ok(),
+            "quarantine rewrite must store a numeric timestamp, got {rewritten:?}"
+        );
+
+        env::remove_var("CREDENTIALS_LEGACY_DIR");
+    }
+
+    #[test]
+    fn remove_legacy_if_snapshot_unchanged_refuses_changed_file() {
+        with_temp_cwd(|| {
+            fs::create_dir_all("credentials").unwrap();
+            let path = PathBuf::from("credentials/gemini.json");
+            fs::write(
+                &path,
+                r#"{"username":"old","password":"oldpass","service":"gemini"}"#,
+            )
+            .unwrap();
+            let (expected, expected_mtime) = read_freshest_legacy_credentials("gemini")
+                .unwrap()
+                .expect("legacy present");
+
+            // Simulate an older unlocked build rewriting after our decision.
+            fs::write(
+                &path,
+                r#"{"username":"fresh","password":"newpass","service":"gemini"}"#,
+            )
+            .unwrap();
+
+            match remove_legacy_if_snapshot_unchanged("gemini", &expected, expected_mtime).unwrap()
+            {
+                LegacyCleanupOutcome::Cleared => {
+                    panic!("changed legacy file must not be deleted")
+                }
+                LegacyCleanupOutcome::Changed {
+                    credentials,
+                    mtime: _,
+                } => {
+                    assert_eq!(credentials.username, "fresh");
+                    assert_eq!(credentials.password, "newpass");
+                    assert!(
+                        path.exists(),
+                        "changed plaintext must remain for reconciliation"
+                    );
+                }
+            }
+        });
     }
 
     #[test]
